@@ -70,6 +70,10 @@ export class MulticaApi {
   async setMetadata(issueId: string, key: string, value: string, signal?: AbortSignal): Promise<void> {
     await this.request('PUT', `/api/issues/${encodeURIComponent(issueId)}/metadata/${encodeURIComponent(key)}`, z.unknown(), { value }, signal)
   }
+  /** Moves an issue to a status, such as `done` or `cancelled`, without the run a status change may otherwise start. */
+  async setStatus(issueId: string, status: string, signal?: AbortSignal): Promise<void> {
+    await this.request('PUT', `/api/issues/${encodeURIComponent(issueId)}`, z.unknown(), { status, suppress_run: true }, signal)
+  }
   getIssue(issueId: string, signal?: AbortSignal): Promise<Issue> {
     return this.request('GET', `/api/issues/${encodeURIComponent(issueId)}`, IssueSchema, undefined, signal)
   }

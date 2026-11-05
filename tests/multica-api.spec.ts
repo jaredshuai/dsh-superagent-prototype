@@ -14,4 +14,14 @@ describe('MulticaApi', () => {
     expect(requests).toEqual([{ url: 'https://multica.test/api/issues?workspace_id=w',
       body: { title: 'Add a file', description: 'd', assignee_id: 'a1', assignee_type: 'agent', allow_duplicate: true } }])
   })
+  it('changes an issue status without starting a run, as `multica issue status --no-start` does', async () => {
+    const requests: { method?: string; url: string; body: unknown }[] = []
+    const fetcher = (async (url: URL, init: RequestInit) => {
+      requests.push({ method: init.method, url: String(url), body: JSON.parse(String(init.body)) })
+      return new Response(JSON.stringify({ id: 'i1', status: 'done' }), { status: 200 })
+    }) as unknown as typeof fetch
+    const api = new MulticaApi({ serverUrl: 'https://multica.test', workspaceId: 'w', token: 'mul_x' }, fetcher)
+    await api.setStatus('i1', 'done')
+    expect(requests).toEqual([{ method: 'PUT', url: 'https://multica.test/api/issues/i1?workspace_id=w', body: { status: 'done', suppress_run: true } }])
+  })
 })

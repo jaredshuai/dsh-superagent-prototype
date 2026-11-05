@@ -1,6 +1,6 @@
 /** MulticaExecutor against a fake Multica API and a recording Engine. */
 import { describe, expect, it, vi } from 'vitest'
-import type { Assignment, Ticket, Trigger } from '../src/core/index.ts'
+import type { Assignment, Ticket, TicketOutcome, Trigger } from '../src/core/index.ts'
 import type { Comment, PostedComment, Run } from '../src/executor/multica-api.ts'
 import { MULTICA_KV, MulticaExecutor, type MulticaExecutorHost, type MulticaTicketState } from '../src/executor/multica.ts'
 import { REPORT_FENCE } from '../src/executor/multica-protocol.ts'
@@ -67,6 +67,7 @@ function setup(initial: Ticket, options: { agents?: string[]; pickHealthy?: bool
       return { ...comment, trigger_outcomes: content.startsWith('/note') || outcome === 'none' ? [] : [{ status: outcome, target_id: AGENT }] }
     }),
     cancelRun: vi.fn(async () => {}),
+    setStatus: vi.fn(async (_issue: string, _status: string) => {}),
     agents: vi.fn(async () => agents.map(agent => ({ ...agent }))),
     runtimes: vi.fn(async () => runtimes.map(runtime => ({ ...runtime }))),
   }
@@ -76,6 +77,7 @@ function setup(initial: Ticket, options: { agents?: string[]; pickHealthy?: bool
       tickets: { get: () => ticket, open: () => ticket.ended ? [] : [ticket] },
       triggers: { get: (id: string) => id === 'tr1' ? trigger : undefined },
       get: (key: string) => kv.get(key), set: (key: string, value: unknown) => { kv.set(key, value) }, delete: (key: string) => { kv.delete(key) },
+      keys: (family: string | { prefix: string }) => [...kv.keys()].filter(key => key.startsWith(typeof family === 'string' ? family : family.prefix)),
       settings: () => ({ policy: { rules: [] }, executor: { directory: '' } }), atomic: <T>(work: () => T) => work(),
     },
     effects: { enqueue: (kind: string, key: string) => { enqueued.push({ kind, key }) },
@@ -282,6 +284,110 @@ describe('MulticaExecutor', () => {
     h.runs[0]!.status = 'cancelled'
     await h.executor.reconcile('t1')
     expect(h.engine.turnEnded).not.toHaveBeenCalled()
+    expect(h.api.setStatus).not.toHaveBeenCalled()
+  })
+
+  describe('closing the issue when its ticket ends (#9)', () => {
+    async function ending(outcome: TicketOutcome) {
+      const h = setup(ticketWith([{ state: 'pending' }]))
+      await h.launch()
+      h.setTicket(ticketWith([{}]))
+      h.runs.push({ id: 'r1', status: 'running' }, { id: 'r0', status: 'completed' })
+      const ended = ticketWith([{ state: 'ended' }], { ended: { at: '2026-11-05T01:00:00Z', by: 'executor', outcome } } as Partial<Ticket>)
+      h.setTicket(ended)
+      return { h, stop: () => { h.executor.stop(ended, ended.assignments[0]!, outcome) } }
+    }
+    it.each<[TicketOutcome, string]>([['merged', 'done'], ['completed', 'done'], ['closed', 'cancelled'], ['dropped', 'cancelled'], ['stopped', 'cancelled']])(
+      'moves the issue of a ticket that ended %s to %s, after cancelling its active runs', async (outcome, status) => {
+        const { h, stop } = await ending(outcome)
+        stop()
+        await vi.waitFor(() => { expect(h.api.setStatus).toHaveBeenCalledWith('issue-1', status) })
+        expect(h.api.cancelRun).toHaveBeenCalledTimes(1)
+        expect(h.api.cancelRun.mock.invocationCallOrder[0]).toBeLessThan(h.api.setStatus.mock.invocationCallOrder[0]!)
+        expect(h.state()!.cancelled).toContain('r1')
+      })
+    it('closes an issue whose ticket ended while Multica was still creating it', async () => {
+      const h = setup(ticketWith([{ state: 'pending' }]))
+      const ended = ticketWith([{ state: 'ended' }], { ended: { at: '2026-11-05T01:00:00Z', by: 'human', outcome: 'stopped' } } as Partial<Ticket>)
+      h.api.createIssue.mockImplementationOnce(async () => {
+        h.setTicket(ended)
+        h.executor.stop(ended, ended.assignments[0]!, 'stopped')
+        return { id: 'issue-1', identifier: 'JAR-1' }
+      })
+      await h.launch()
+      await vi.waitFor(() => { expect(h.api.setStatus).toHaveBeenCalledWith('issue-1', 'cancelled') })
+      expect(h.engine.assignmentStarted).not.toHaveBeenCalled()
+    })
+    it('reopens the closed issue for a woken ticket before posting its new Assignment, and leaves the new run alone', async () => {
+      const { h, stop } = await ending('merged')
+      stop()
+      await vi.waitFor(() => { expect(h.api.setStatus).toHaveBeenCalledWith('issue-1', 'done') })
+      h.runs[0]!.status = 'cancelled'
+      const woken = ticketWith([{ state: 'ended' }, { state: 'pending' }])
+      h.setTicket(woken)
+      h.executor.start(woken, woken.assignments[1]!)
+      await h.runLaunches()
+      expect(h.api.setStatus).toHaveBeenLastCalledWith('issue-1', 'todo')
+      expect(h.api.setStatus.mock.invocationCallOrder.at(-1)).toBeLessThan(h.api.addComment.mock.invocationCallOrder.at(-1)!)
+      h.setTicket(ticketWith([{ state: 'ended' }, {}]))
+      h.runs.push({ id: 'r2', status: 'running' })
+      await h.executor.reconcile('t1')
+      expect(h.api.cancelRun).toHaveBeenCalledTimes(1)
+      expect(h.api.setStatus).toHaveBeenCalledTimes(2)
+    })
+    it('does not close the issue of a ticket woken while its close was still pending', async () => {
+      const { h, stop } = await ending('merged')
+      h.api.setStatus.mockRejectedValueOnce(new Error('Multica PUT failed'))
+      stop()
+      await vi.waitFor(() => { expect(h.api.setStatus).toHaveBeenCalledTimes(1) })
+      await settle()
+      const woken = ticketWith([{ state: 'ended' }, { state: 'pending' }])
+      h.setTicket(woken)
+      h.executor.start(woken, woken.assignments[1]!)
+      h.setTicket(ticketWith([{ state: 'ended' }, {}]))
+      h.runs.push({ id: 'r2', status: 'running' })
+      await h.executor.reconcile('t1')
+      expect(h.api.setStatus).toHaveBeenCalledTimes(1)
+      expect(h.api.cancelRun).toHaveBeenCalledTimes(1)
+    })
+    it('closes the issue again when its ticket ended while a later Assignment was being posted to it', async () => {
+      const { h } = await ending('stopped')
+      h.setTicket(ticketWith([{ state: 'ended', endedReason: 'retried' }, { state: 'pending' }]))
+      const ended = ticketWith([{ state: 'ended' }, { state: 'ended' }], { ended: { at: '2026-11-05T01:00:00Z', by: 'human', outcome: 'stopped' } } as Partial<Ticket>)
+      h.api.addComment.mockImplementationOnce(async (_issue: string, content: string) => {
+        h.setTicket(ended)
+        h.executor.stop(ended, ended.assignments[1]!, 'stopped')
+        await settle()
+        h.runs.push({ id: 'r3', status: 'queued' })
+        return { id: 'c9', issue_id: 'issue-1', author_type: 'member', content, created_at: '', trigger_outcomes: [] }
+      })
+      h.runs.splice(0)
+      await h.launch('a2')
+      await vi.waitFor(() => { expect(h.api.setStatus).toHaveBeenCalledTimes(2) })
+      expect(h.api.cancelRun).toHaveBeenCalledWith('r3')
+    })
+    it('records a failed close in the worker health entry and tries again on the next reconciliation', async () => {
+      const { h, stop } = await ending('merged')
+      h.api.setStatus.mockRejectedValueOnce(new Error('Multica PUT failed'))
+      await h.connect()
+      stop()
+      await vi.waitFor(() => { expect(h.health.set).toHaveBeenCalledWith(expect.objectContaining({ state: 'error', detail: expect.stringContaining('Multica PUT failed') })) })
+      await h.push({ type: 'issue:updated', payload: { issue: { id: 'issue-1' } } })
+      expect(h.api.setStatus).toHaveBeenCalledTimes(2)
+      await h.push({ type: 'comment:created', payload: { comment: { issue_id: 'issue-1' } } })
+      expect(h.api.setStatus).toHaveBeenCalledTimes(2)
+    })
+    it('closes after a restart what it could not close before, once the event stream connects', async () => {
+      const { h, stop } = await ending('stopped')
+      h.api.setStatus.mockRejectedValueOnce(new Error('Multica PUT failed'))
+      stop()
+      await vi.waitFor(() => { expect(h.api.setStatus).toHaveBeenCalledTimes(1) })
+      await settle()
+      h.restart()
+      await h.connect()
+      expect(h.api.setStatus).toHaveBeenLastCalledWith('issue-1', 'cancelled')
+      expect(h.api.setStatus).toHaveBeenCalledTimes(2)
+    })
   })
 
   describe('refused report blocks', () => {

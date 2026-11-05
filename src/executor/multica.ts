@@ -5,8 +5,8 @@
  * `superagent-report` comment blocks (see `multica-protocol.ts`). Facts arrive by push over the workspace WebSocket; each
  * (re)connection catches up once through REST. See docs/009-multica-executor.md.
  */
-import { latestAssignment, liveTicket, runningAssignment, type Assignment, type EngineForExecutor, type Ticket, type Trigger }
-  from '../core/index.ts'
+import { latestAssignment, liveTicket, runningAssignment, type Assignment, type EngineForExecutor, type Ticket, type TicketOutcome,
+  type Trigger } from '../core/index.ts'
 import type { AssessmentOutcome, Executor } from '../core/ports.ts'
 import type { WorkerReport } from '../core/assignments.ts'
 import type { Effects } from '../app/effects.ts'
@@ -78,6 +78,8 @@ export interface MulticaTicketState {
   cancelled?: string[]
   /** Refused report blocks whose note to the worker has not reached Multica yet. */
   refusals?: Refusal[]
+  /** The status the issue was closed with when its ticket ended; a woken ticket reopens it. */
+  closed?: IssueEnd
 }
 /** A refused report block: the `index`th block of an agent comment, and the note that tells its worker why. */
 export interface Refusal { commentId: string; index: number; note: string }
@@ -86,7 +88,13 @@ export const MULTICA_KV = {
   issue: family<string>('multica-issue:'),
   /** A ticket whose first Assignment waits for a healthy candidate, once a person has been asked to start a workstation, and what they were asked. */
   waiting: family<{ assignmentId: string; question: string }>('multica-waiting:'),
+  /** An ended ticket whose issue is not closed yet, and the status it is closed with; kept until Multica took it. */
+  closing: family<{ status: IssueEnd }>('multica-closing:'),
 }
+/** The Multica status an ended ticket's issue moves to. */
+export type IssueEnd = 'done' | 'cancelled'
+/** A ticket that ended with its result or its PR merged is done; one closed unmerged, with nothing to do, or stopped is cancelled. */
+const issueEnd = (outcome: TicketOutcome): IssueEnd => outcome === 'completed' || outcome === 'merged' ? 'done' : 'cancelled'
 const SEEN_LIMIT = 500
 /** How many cancelled runs, deliveries and pending refusal notes a ticket's state keeps. */
 const HISTORY_LIMIT = 50
@@ -94,7 +102,7 @@ const HISTORY_LIMIT = 50
 export interface MulticaExecutorHost {
   readonly engine: Pick<EngineForExecutor, 'assignmentStarted' | 'inputsDelivered' | 'inputsRead' | 'turnEnded' | 'deliveryFailed' | 'report'
     | 'reply' | 'handback' | 'followForContext' | 'markUnrelated'>
-  readonly store: Pick<Store, 'tickets' | 'triggers' | 'get' | 'set' | 'delete' | 'settings' | 'atomic'>
+  readonly store: Pick<Store, 'tickets' | 'triggers' | 'get' | 'set' | 'delete' | 'keys' | 'settings' | 'atomic'>
   readonly effects: Pick<Effects, 'enqueue' | 'handle'>
   readonly sessions: Pick<Sessions, 'relay'>
   /** The `worker` health entry: the event stream's state and the last failure. */
@@ -102,7 +110,7 @@ export interface MulticaExecutorHost {
   readonly machine: { stateDir: string }
   readonly lifetime: AbortSignal
   readonly config: MulticaExecutorConfig
-  readonly api: Pick<MulticaApi, 'createIssue' | 'setMetadata' | 'findIssues' | 'runs' | 'comments' | 'addComment' | 'cancelRun' | 'agents' | 'runtimes'>
+  readonly api: Pick<MulticaApi, 'createIssue' | 'setMetadata' | 'findIssues' | 'runs' | 'comments' | 'addComment' | 'cancelRun' | 'setStatus' | 'agents' | 'runtimes'>
   /** Builds the event stream's sockets; tests pass their own. */
   readonly socketFactory?: SocketFactory
   closing(): boolean
@@ -156,13 +164,20 @@ export class MulticaExecutor implements Executor {
     return { ...ticket, execution: ticketExecution(ticket, outcome, this.host.store.settings(), this.host.machine.stateDir) }
   }
   start(ticket: Ticket, assignment: Assignment): void {
+    // A woken ticket's issue is no longer to be closed.
+    this.host.store.delete(MULTICA_KV.closing(ticket.id))
     this.host.effects.enqueue('launch', assignment.id, { ticketId: ticket.id, assignmentId: assignment.id })
   }
   deliver(ticket: Ticket, _assignment: Assignment): void { this.host.effects.enqueue('delivery', ticket.id, { ticketId: ticket.id }) }
-  /** Cancels the issue's active runs; the domain already ended the Assignment. */
+  /**
+   * Cancels the issue's active runs; the domain already ended the Assignment. When the ticket ended with it, the issue
+   * is also closed, as done or cancelled by the ticket's outcome, and a close Multica did not take is tried again on
+   * the next reconciliation.
+   */
   stop(ticket: Ticket, _assignment: Assignment, _reason: string): void {
     const state = this.state(ticket.id)
     if (!state) return
+    if (this.queueCloseIfEnded(ticket)) return
     void this.cancelActive(ticket.id, state.issueId).catch((error: unknown) => { this.failure(`Cancelling ${state.identifier ?? state.issueId}`, error) })
   }
   /** Connects the event stream. */
@@ -245,13 +260,23 @@ export class MulticaExecutor implements Executor {
         this.save(ticketId, { issueId: issue.id, identifier: issue.identifier ?? undefined, agentId, assignment: { id: assignmentId, nonce },
           deliveries: [], seen: [], runs: {} })
         this.dispatched(ticketId, agentId)
+        // A ticket that ended while the issue was being created had no issue to close when it stopped.
+        // Its `superagent_ticket` metadata is skipped too: the saved state finds the issue, and an ended ticket launches nothing more.
+        const ended = this.host.store.tickets.get(ticketId)
+        if (ended && this.queueCloseIfEnded(ended)) return
         await this.host.api.setMetadata(issue.id, 'superagent_ticket', ticketId)
       } else {
         // Runs of earlier Assignments are the baseline: only runs that start from here on are this Assignment's turns.
         const before = await this.host.api.runs(state.issueId)
-        this.save(ticketId, { ...state, assignment: { id: assignmentId, nonce }, runs: Object.fromEntries(before.map(run => [run.id, run.status])),
+        // The issue of a woken ticket was closed when the ticket ended; reopen it without a run, which the comment starts.
+        if (state.closed) await this.host.api.setStatus(state.issueId, 'todo')
+        const { closed: _closed, ...open } = state
+        this.save(ticketId, { ...open, assignment: { id: assignmentId, nonce }, runs: Object.fromEntries(before.map(run => [run.id, run.status])),
           cancelled: [...state.cancelled ?? [], ...before.filter(run => !ENDED_STATUSES.has(run.status)).map(run => run.id)].slice(-HISTORY_LIMIT) })
         const posted = await this.host.api.addComment(state.issueId, laterAssignmentComment(brief))
+        // A ticket that ended while the comment was posted may have closed the issue before the comment started a run.
+        const ended = this.host.store.tickets.get(ticketId)
+        if (ended && this.queueCloseIfEnded(ended)) return
         const refused = refusedOutcome(posted.trigger_outcomes ?? undefined, this.agentOf(state))
         if (refused) throw new Error(`Multica did not start the agent: ${refused}`)
       }
@@ -385,9 +410,10 @@ export class MulticaExecutor implements Executor {
     const ticketId = issueId && this.host.store.get(MULTICA_KV.issue(issueId))
     if (ticketId) this.schedule(ticketId)
   }
-  /** Reconciles every open ticket that has an issue, after the event stream (re)connected. */
+  /** Reconciles every open ticket that has an issue, and closes the issues of ended tickets not closed yet, after the event stream (re)connected. */
   private catchUp(): void {
     for (const ticket of this.host.store.tickets.open()) if (this.state(ticket.id)) this.schedule(ticket.id)
+    for (const key of this.host.store.keys(MULTICA_KV.closing)) this.schedule(key.slice(MULTICA_KV.closing.prefix.length))
   }
   /** Queues a reconciliation of one ticket; events that arrive while one runs fold into one more. */
   private schedule(ticketId: string): void {
@@ -401,11 +427,14 @@ export class MulticaExecutor implements Executor {
 
   /**
    * Brings one ticket up to date with its issue: report blocks in new agent comments, Inputs the issue's runs took in, the
-   * end of a turn when the issue's last active run ended, and a delivery when Inputs wait and no run waits to start.
+   * end of a turn when the issue's last active run ended, and a delivery when Inputs wait and no run waits to start. An
+   * ended ticket's issue is closed instead, when that is still to do.
    */
   async reconcile(ticketId: string): Promise<void> {
     const state = this.state(ticketId)
     const ticket = this.host.store.tickets.get(ticketId)
+    const closing = this.host.store.get(MULTICA_KV.closing(ticketId))
+    if (state && ticket && !liveTicket(ticket) && closing) return this.close(ticketId, state, closing.status)
     if (!state || !ticket || !liveTicket(ticket)) return
     const [runs, comments] = await Promise.all([this.host.api.runs(state.issueId), this.host.api.comments(state.issueId)])
     // Reports first, so a report and the end of the turn that made it arrive in that order.
@@ -439,6 +468,27 @@ export class MulticaExecutor implements Executor {
     }
     // A delivery Multica refused waits for the next Input or a retry; delivering it again here would post it on every event.
     if (live!.undelivered.length && !live!.delivery && !runs.some(run => WAITING_STATUSES.has(run.status))) this.deliver(live!, assignment)
+  }
+  /** Records that an ended ticket's issue is to be closed and queues its reconciliation; returns whether the ticket has ended. */
+  private queueCloseIfEnded(ticket: Ticket): boolean {
+    if (!ticket.ended) return false
+    this.host.store.set(MULTICA_KV.closing(ticket.id), { status: issueEnd(ticket.ended.outcome) })
+    this.schedule(ticket.id)
+    return true
+  }
+  /** Closes an ended ticket's issue: cancels its active runs, then moves it to its end status without starting a run. */
+  private async close(ticketId: string, state: MulticaTicketState, status: IssueEnd): Promise<void> {
+    try {
+      await this.cancelActive(ticketId, state.issueId)
+      await this.host.api.setStatus(state.issueId, status)
+      this.host.store.atomic(() => {
+        this.save(ticketId, { ...this.state(ticketId) ?? state, closed: status })
+        this.host.store.delete(MULTICA_KV.closing(ticketId))
+      })
+    } catch (error) {
+      if (this.host.closing()) throw error
+      this.failure(`Closing ${state.identifier ?? state.issueId} as ${status}`, error)
+    }
   }
   private runFailure(run: Run): string {
     return `The Multica run ${run.id} failed${run.error ? `: ${run.error}` : ''}. Its messages (multica issue run-messages ${run.id}) tell why.`

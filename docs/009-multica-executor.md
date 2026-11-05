@@ -216,6 +216,14 @@ daemon_id 是机器级的，存在 `~/.multica/daemon.id`，CLI daemon 与桌面
 - 对账（每个 Ticket 串行）：由 WebSocket 事件触发，每次（重）连接对所有有 issue 的未结束 Ticket 补一次。先处理新的 agent 评论里的回报块，
   再看 run：issue 上不再有活跃 run 且出现新结束的 run（不含本执行器取消的）⇒ `turnEnded`；最后一个是 `failed` 则先记 `failed` 回报。
 - `stop`：取消 issue 上所有活跃 run，并记入 `cancelled`，其结束不算 turn 结束。
+- Ticket 结束时关闭 issue（#9）：`stop` 见到 Ticket 已结束，就在 `multica-closing:<ticket>` 记下目标状态——`completed` / `merged` ⇒ `done`，
+  `closed` / `dropped` / `stopped` ⇒ `cancelled`——再走该 Ticket 的对账链：先取消活跃 run，再 `PUT /api/issues/<id>`
+  `{"status": …, "suppress_run": true}`（与 `multica issue status --no-start` 相同，改状态不起新 run）。成功才删记录；失败记在 `worker` 健康项里，
+  该 issue 的下一个事件或事件流（重）连接时的补齐再试，重启后也一样。建 issue 的请求在飞时 Ticket 结束（`stop` 时还没有 issue），建好后立即按同样方式关闭。
+  重试 Ticket（`retried`）时 Ticket 未结束，只取消 run，不关 issue。
+  已关闭的 issue 状态记在 Ticket 状态的 `closed` 里：结束的 Ticket 被人的新消息唤醒时，`start` 撤掉还没完成的关闭，新 Assignment 发评论前先把 issue
+  改回 `todo`（同样 `suppress_run`，run 由评论触发）。往已有 issue 发后续 Assignment 的评论期间 Ticket 结束的话，评论发出后再关一次，取消它起的 run。
+  只处理本改动之后结束的 Ticket：之前已结束的（如 JAR-53/54/55）不会补关，需要手动 `multica issue status <id> done|cancelled --no-start`。
 - 回报被拒的反馈：配置的 agent 发出的回报块被拒时（不是 JSON / 缺字段 / 字段不合 schema、assignment 不是当前的、nonce 不对、
   PR 认领被拒、Engine 抛错），在那条评论下回复一条 `/note superagent: report block N in this comment was refused: <原因>…`，
   原因里出现的 nonce 一律替换成 `<nonce>`。PR 认领被拒时整条回报不记（与 DshExecutor 的 `orchestrator_report` 一致）。
@@ -333,6 +341,7 @@ PR #8 的作者与提交作者都是 `jaredwtt1203`。
 - 放宽 `refusedOutcome` 的代价：评论确实没触发任何 run（如 issue 被取消指派）时会被记为已投递，只剩 `deliveries[].read` 一直为 false；
   steer 投递若没有 outcome 也会被当作成功（本次 runtime 不能 steer，未实测）。
 
-- Ticket 结束（停止或 PR 合并）时 Multica issue 不会关闭（JAR-53/54/55 仍是 in_review / todo），工作区里会积累活跃 issue。
+- ~~Ticket 结束（停止或 PR 合并）时 Multica issue 不会关闭（JAR-53/54/55 仍是 in_review / todo），工作区里会积累活跃 issue。~~
+  已做（#9），见第 8 节「Ticket 结束时关闭 issue」。改状态的请求体取自 multica CLI 0.8.0 对本地假服务器发出的请求；线上未实测。
 
 **还没验证**：重启中的 run 正常结束（那个 run 因 jxccs 上 opencode 免费额度用完而 failed，但重启本身没有打断它）。
