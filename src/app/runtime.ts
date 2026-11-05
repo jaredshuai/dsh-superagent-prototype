@@ -33,7 +33,9 @@ import { registerHttp, type HttpHost } from './http.ts'
 import type { LinkTarget } from './views/records.ts'
 import { candidateCard, repliedTo, sourceLink, type LinkHost } from './links.ts'
 import { eventNotice, followupNotice } from './notices.ts'
-import { pullEndNotices } from '../sources/github-pull.ts'
+import { claimPull, pullEndNotices, readPull } from '../sources/github-pull.ts'
+import { MulticaExecutor, multicaConfigFromEnv } from '../executor/multica.ts'
+import { MulticaApi } from '../executor/multica-api.ts'
 import { HealthBoard } from '../infra/health.ts'
 import { Outbox } from './outbox.ts'
 import { Passes } from './passes.ts'
@@ -65,7 +67,8 @@ export class Runtime extends Service implements SourceHost {
   readonly commands: Commands
   readonly sessions: Sessions
   readonly settings: Settings
-  readonly executor: DshExecutor
+  /** Runs Assignments: local DSH worker Sessions, or remote workers through Multica when `SUPERAGENT_EXECUTOR=multica`. */
+  readonly executor: DshExecutor | MulticaExecutor
   readonly assessor: MasterAssessor
   readonly outbox: Outbox
   readonly engine: Engine
@@ -125,9 +128,19 @@ export class Runtime extends Service implements SourceHost {
       const policyChanged: EngineForSettings['policyChanged'] = (from, to, effects) => { this.engine.policyChanged(from, to, effects) }
       this.settings = new Settings({ store, sources, engine: { policyChanged }, health: board, context: ctx, lifetime: this.lifetime, sessions,
         sourceHost: this, setup, requestPass: () => { this.passes.request() } })
-      this.executor = new DshExecutor({ context: ctx, get engine() { return runtime.engine }, store, effects, health: board.claim('worker'), machine,
-        lifetime: this.lifetime, sessions, closing: () => this.closing(), paused: () => this.paused(), environment, sourceLink: link,
-        repliedTo: trigger => repliedTo({ store, sources }, trigger) })
+      const multica = multicaConfigFromEnv(process.env)
+      this.executor = multica
+        ? new MulticaExecutor({ get engine() { return runtime.engine }, store, effects, sessions, health: board.claim('worker'), machine,
+          lifetime: this.lifetime, config: multica, api: new MulticaApi(multica), closing: () => this.closing(), paused: () => this.paused(),
+          sourceLink: link, repliedTo: trigger => repliedTo({ store, sources }, trigger), sendReplies: () => runtime.outbox.sent(),
+          claimPull: async (ticketId, number, signal) => {
+            const github = runtime.context({ kind: 'github', health: ['github'] })
+            const pull = await readPull(github, number, signal)
+            return store.atomic(() => claimPull(github, ticketId, pull))
+          } })
+        : new DshExecutor({ context: ctx, get engine() { return runtime.engine }, store, effects, health: board.claim('worker'), machine,
+          lifetime: this.lifetime, sessions, closing: () => this.closing(), paused: () => this.paused(), environment, sourceLink: link,
+          repliedTo: trigger => repliedTo({ store, sources }, trigger) })
       this.assessor = new MasterAssessor({ get engine() { return runtime.engine }, commands, get deployment() { return setup.deployment }, effects,
         settings: () => store.settings(), paused: () => this.paused(), threadContext: trigger => sources.threadContext(trigger),
         deliver: (id, text) => sessions.prompt(masterId, id, text, 'steer'), candidateCard: candidate => candidateCard(links, candidate) })

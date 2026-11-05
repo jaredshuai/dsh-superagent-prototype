@@ -1,4 +1,4 @@
-# 900 MulticaExecutor 设计稿（草案）
+# 009 MulticaExecutor 设计稿（草案）
 
 > 状态：草案，2026-11-05。尚未实现，标注「待验证」的地方需先做实测。
 > 目标：让 dsh-superagent 的 Ticket 不在云端本机执行，而是经 Multica 派到操作者自己的工作站（BYOM），
@@ -11,11 +11,11 @@
 | 端口方法 | DshExecutor（现有） | MulticaExecutor（新增） |
 | --- | --- | --- |
 | `start(ticket, assignment)` | 起 `worker-<id>` 本机 dsh 会话 + prepare 目录 | 建 Multica issue，metadata 写 `superagent_ticket` / `superagent_assignment`，指派给选定的 agent（= 某台机器上的某个 runtime） |
-| `deliver(ticket, assignment)` | `sessions.prompt(..., 'steer')` 注入运行中的会话 | 有活跃 run：`comment add --steer <run>`；无活跃 run：普通评论并重新触发一轮（待验证） |
+| `deliver(ticket, assignment)` | `sessions.prompt(..., 'steer')` 注入运行中的会话 | 活跃 run 且 `can_supplement`：`comment add --steer <run>`；否则把所有未投递 Input **合并成一条**普通评论，且只在 issue 上没有 queued run 时才发（见第 7 节 spike 结论） |
 | `stop(ticket, assignment, reason)` | 取消会话 turn、杀后台 job | `issue cancel-task` |
 
 Engine 回调（`assignmentStarted` / `inputsDelivered` / `inputsRead` / `turnEnded` / `report` / `deliveryFailed`）
-由 MulticaExecutor 内部的**轮询循环**产生：轮询 issue 的 run 状态与 run-messages（`since` 游标续传）。
+由 MulticaExecutor 内部的事件处理产生：实时靠 WebSocket 推送，连接建立/重连时 REST 补齐一次 run 状态与 run-messages（`since` 游标续传），见第 6 节。
 
 Ticket、Eval、Policy、Outbox、Sources、面板都不改。新增代码集中在 `src/executor/multica*.ts`，
 以便与上游同步时少冲突。
@@ -64,9 +64,10 @@ DshExecutor 的 Worker 通过会话内的宿主工具与 Engine 交互（`src/ap
 | Ticket | issue（metadata 反查） | 一个 Ticket 一个 issue，跨 Assignment 复用 |
 | Assignment | issue 上的一串 run | 新 Assignment（retry / restart）= 取消旧 run 后重新触发 |
 | Worker turn | 一个 run | run `completed` 且无回报 ⇒ `turnEnded` ⇒ `waiting` |
-| Input 投递 | 评论 / `--steer` | **steer 限额：每 agent 每 run 3 条、合计 10 条**（实测），超出后排队等 run 结束再以新评论触发 |
-| `inputsRead` | run-messages 中出现对该评论的处理 | 粗粒度：run 开始即视为已读（待细化） |
-| 工作目录 | 工作站上的 issue workdir | **实测每个 run 一个隔离 workdir、跨 run 不共享**：状态必须靠 git 分支 `agent/<name>` 持久化，每轮先 checkout 该分支 |
+| Input 投递 | 评论 / `--steer` | steer 只对支持的 runtime 有效（见第 7 节）；不支持时每条评论各自排一个 run，必须合并 |
+| `inputsDelivered` | 投递评论的 id 出现在某个 run 的 `trigger_comment_id` / `delivered_comment_ids` 里 | 发评论成功 ≠ 已投递 |
+| `inputsRead` | 上述 run 进入 `running` | 粗粒度，足够 |
+| 工作目录 | 工作站上的 issue workdir | 同一 daemon 上同一 issue 的后续 run **复用** workdir（JAR-49 实测）；换 daemon / 换机器则是新目录。⇒ 仍以 git 分支 `agent/<name>` 为唯一可靠状态，每轮先 fetch + checkout，已存在的 checkout 直接复用 |
 
 ## 4. 机器与 runtime 选择
 
@@ -158,3 +159,61 @@ daemon_id 是机器级的，存在 `~/.multica/daemon.id`，CLI daemon 与桌面
 5. 各 runtime（claude / codex / dsh）对「先读 issue 描述里的协议说明、再按协议回报」的遵从度。
 6. Multica agent 能否按 issue 注入 MCP 配置（决定方案 A 是否可行）。
 7. 用 `mul_` token 连 `wss://api.multica.ai/ws` 是否真能收到 `task:*` 与 `comment:created`（源码支持，线上未实测）；心跳与断线行为。
+
+### 7.1 Spike 结论（2026-11-05，jxccs，测试 agent `failover-test-jxccs`，opencode runtime）
+
+| # | 问题 | 结论 | 证据 |
+| --- | --- | --- | --- |
+| 1 | 无活跃 run 时发普通评论会起新 run 吗？ | **会，立即**。run 的 `attribution.evidence.kind = comment`，`trigger_comment_id` = 该评论；评论 id 也出现在 `delivered_comment_ids` | JAR-49 第 2 轮，评论后 3 s 进入 running |
+| 2 | run 内能否调 `multica issue comment add`？ | **能**，无需另装另登录。PATH 里是 daemon 自带的 CLI（桌面端：`/opt/Multica/resources/app.asar.unpacked/resources/bin/multica`），`$MULTICA_TASK_ID` 有值；评论作者为 `agent`。评论触发的 run 回复时须带 `--parent <触发评论>` | JAR-49 R1/R2 评论 |
+| 3 | 下一轮能否续用上一轮推送的分支？ | **能**。而且同一 daemon 上同一 issue 的 workdir 是**复用**的（上一轮 checkout 还在，`git clone` 会因目录已存在而失败）——Worker 指令要写成幂等的「有就 fetch，没有就 clone」 | JAR-49：`STATE=run1,run2`，两轮 `work_dir` 相同 |
+| 4 | steer 限额触顶后的行为 | 比预想更严：**opencode run 根本不能 steer**，12 次 `--steer` 全部返回 `trigger_outcomes[].status = queued`，且**每条评论各排一个 run，不合并**（12 个 queued run）。取消排队 run 后，其评论**不会**并入后续 run（只投递了 STEER-1）；follow-up run 把整个任务从头重做 | JAR-50 |
+| 4b | 哪些 runtime 能 steer？ | 源码 `server/pkg/agent/version.go` `SupportsTaskSupplement`：仅 `pi ≥1.4.0`、`codex ≥0.100.0`、`claude ≥2.1.110`、`grok ≥1.0.14`、`kiro ≥2.33.0`、`cursor ≥2026.10.14`，且 run 必须挂在 issue 上；**opencode、dsh 等不支持**。daemon 在 task start 时协商 `DaemonCapabilityTaskSupplementV1`，run 上暴露为 `can_supplement` | 源码 |
+| 7 | WebSocket 事件流 | **可用**。`wss://api.multica.ai/ws?workspace_id=<W>`，首帧 `{"type":"auth","payload":{"token":"mul_…"}}` → `auth_ack`（约 1 s）。不带 Origin 头即可（服务端对无 Origin 放行）。工作区作用域自动订阅，收到 `issue:created`、`task:queued/dispatch/running/progress/usage/completed`、`comment:created`（含完整评论正文、`author_type`、`parent_id`）、`agent:status`、`activity:created`、`inbox:new` 等；每帧带 `event_id`（ULID，可去重）。`task:message` 需发 `{"type":"subscribe","payload":{"scope":"task","id":<run>}}`，回 `subscribe_ack` 后即推送 run 内消息（带 `seq`）。`task:completed` 只有 `task_id/issue_id/agent_id/status`，result 要 REST 拉。应用层可发 `{"type":"ping"}` 收 `pong`；不发也能保持空闲连接（服务端 54 s 发协议级 ping，Node 自动回 pong，空闲 200 s 未断）。事件延迟：建 issue → `task:queued` 同一秒，评论 → `comment:created` < 1 s | JAR-51，`ws_probe.mjs` |
+
+**对实现的影响（`deliver` 规则）**：
+
+1. issue 上有 running run 且 `can_supplement = true`：`--steer <run>` 发送，检查返回的 `trigger_outcomes`，`steered` 才算投递；返回 `queued` 等则按 3 处理。
+2. issue 上已有 queued run：**不发评论**，等它开始或结束后再发（否则多排一个 run）。
+3. 否则：把 Ticket 的全部未投递 Input 合并成**一条**评论发出，记下评论 id；该 id 出现在某 run 的 `trigger_comment_id` / `delivered_comment_ids` 时调 `inputsDelivered`，该 run 进入 running 时调 `inputsRead`。
+4. 永不取消承载未投递 Input 的 queued run（会丢消息）；`stop` 取消 run 时，对应 Input 视为未投递。
+5. 每个 run 都是完整的一轮 turn，Worker 需要从 issue 描述 + 评论历史 + git 分支重建上下文；描述里的协议说明要强调「先读最新评论、不要重做已完成的步骤」。
+
+## 8. 实现状态（v1，2026-11-05）
+
+代码：`src/executor/multica.ts`（Executor 本体与 `multicaConfigFromEnv`）、`multica-api.ts`（REST）、`multica-events.ts`（WebSocket）、
+`multica-protocol.ts`（评论协议，纯函数）；测试 `tests/multica-*.spec.ts`。核心只改了 `src/app/runtime.ts` 的组装处和 `src/app/http.ts` 的一个类型。
+
+**启用**（不设置时仍是上游的 DshExecutor）：
+
+| 环境变量 | 必填 | 说明 |
+| --- | --- | --- |
+| `SUPERAGENT_EXECUTOR=multica` | 是 | 选择 MulticaExecutor |
+| `MULTICA_TOKEN` | 是 | `mul_` 个人 token，只放环境变量（如 `~/.config/superagent.env`），不进设置 |
+| `MULTICA_WORKSPACE_ID` | 是 | |
+| `MULTICA_AGENT_ID` | 是 | 第一版固定一个 agent（= 一台机器上的一个 runtime） |
+| `MULTICA_SERVER_URL` | 否 | 默认 `https://api.multica.ai` |
+| `SUPERAGENT_MULTICA_REPOSITORY` | 否 | Worker 克隆的仓库，如 `https://github.com/jaredshuai/superagent-sandbox` |
+| `SUPERAGENT_MULTICA_INSTRUCTIONS` | 否 | 追加给每个 Worker 的说明，如「用 `gh-agent` 提交和开 PR」 |
+
+**与第 2 节的差异**：回报防伪第一版不用 HMAC（要求 LLM 在 shell 里算 HMAC 不可靠），改为三重校验：
+评论作者必须是配置的 agent（`author_type = agent`、`author_id` 匹配，由 Multica 服务端保证）、块内 `assignment` 必须是当前 Assignment、
+`nonce` 必须等于该 Assignment 在 issue 描述（或改派评论）里下发的随机值。旧 Assignment 的回报因 nonce 不同一律拒收。
+
+**行为要点**：
+
+- `start`：首个 Assignment 建 issue（描述 = 协议 + Assignment JSON，触发消息全文内联，因为远端读不了 Ticket 资源），metadata 写 `superagent_ticket`；
+  之后的 Assignment（重试等）在同一 issue 发改派评论，带新 nonce，并把当时已有的 run 记为基线。
+- `deliver`：按第 7.1 节规则；成功发出评论即 `inputsDelivered`，带它的 run 开始运行时 `inputsRead`（steer 成功时立即 `inputsRead`）；
+  Multica 返回 `blocked` / `deferred` 等不重试，记 `deliveryFailed`。
+- 对账（每个 Ticket 串行）：由 WebSocket 事件触发，每次（重）连接对所有有 issue 的未结束 Ticket 补一次。先处理新的 agent 评论里的回报块，
+  再看 run：issue 上不再有活跃 run 且出现新结束的 run（不含本执行器取消的）⇒ `turnEnded`；最后一个是 `failed` 则先记 `failed` 回报。
+- `stop`：取消 issue 上所有活跃 run，并记入 `cancelled`，其结束不算 turn 结束。
+- 重启：远端 run 不受影响，所以 `resume` 不打断 running 的 Assignment，只重新排队 pending 的启动；连接建立后的补齐会追上错过的事件。
+
+**还没做**：
+
+1. 回报被拒（nonce 错、PR 认领失败、Engine 报错）只记在 `worker` 健康项里，不会反馈给 Worker。
+2. 多候选 agent 与跨机故障转移（第 4 节）；当前只有一个固定 agent。
+3. 线上端到端联调：在服务器上设置上述环境变量，用测试 agent 跑一张真实 Ticket。
+4. 第 7 节第 5、6 项（各 runtime 对协议的遵从度、MCP 注入）。
