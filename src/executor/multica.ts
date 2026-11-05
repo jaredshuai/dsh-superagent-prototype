@@ -139,6 +139,8 @@ export class MulticaExecutor implements Executor {
   private refreshAgain = false
   /** Tickets whose launch waits for a healthy candidate. */
   private readonly waiting = new Set<string>()
+  /** The delivery each ticket runs now; the next waits for it. */
+  private readonly delivering = new Map<string, Promise<void>>()
   constructor(private readonly host: MulticaExecutorHost) {
     this.candidates = new MulticaCandidates(host.config.agents)
     this.events = new MulticaEvents(host.config, {
@@ -320,8 +322,15 @@ export class MulticaExecutor implements Executor {
     this.host.store.delete(MULTICA_KV.waiting(ticketId))
   }
 
+  /** Delivers one ticket at a time, so the Engine's delivery and a reconciliation's never post the same Inputs twice. */
+  private deliverQueued(ticketId: string): Promise<void> {
+    const next = (this.delivering.get(ticketId) ?? Promise.resolve()).then(() => this.deliverNow(ticketId))
+    const tracked: Promise<void> = next.catch(() => {}).finally(() => { if (this.delivering.get(ticketId) === tracked) this.delivering.delete(ticketId) })
+    this.delivering.set(ticketId, tracked)
+    return next
+  }
   /** Hands a ticket's waiting Inputs to its issue in one comment, or steers them into its running run; waits while a run waits to start. */
-  private async deliverQueued(ticketId: string): Promise<void> {
+  private async deliverNow(ticketId: string): Promise<void> {
     const ticket = this.host.store.tickets.get(ticketId)
     const assignment = ticket && liveTicket(ticket) ? runningAssignment(ticket) : undefined
     const state = this.state(ticketId)
@@ -428,7 +437,8 @@ export class MulticaExecutor implements Executor {
       if (last.status === 'failed') this.reportFailed(ticketId, this.runFailure(last))
       this.host.engine.turnEnded(ticketId, assignment.id)
     }
-    if (live!.undelivered.length && !runs.some(run => WAITING_STATUSES.has(run.status))) this.deliver(live!, assignment)
+    // A delivery Multica refused waits for the next Input or a retry; delivering it again here would post it on every event.
+    if (live!.undelivered.length && !live!.delivery && !runs.some(run => WAITING_STATUSES.has(run.status))) this.deliver(live!, assignment)
   }
   private runFailure(run: Run): string {
     return `The Multica run ${run.id} failed${run.error ? `: ${run.error}` : ''}. Its messages (multica issue run-messages ${run.id}) tell why.`

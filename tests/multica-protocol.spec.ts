@@ -60,7 +60,10 @@ describe('delivery plan', () => {
   it('reads whether a comment reached the agent from its trigger outcomes', () => {
     expect(refusedOutcome([{ status: 'queued', target_id: 'ag' }], 'ag')).toBeUndefined()
     expect(refusedOutcome([{ status: 'blocked', reason_code: 'agent_paused', target_id: 'ag' }], 'ag')).toBe('blocked (agent_paused)')
-    expect(refusedOutcome([], 'ag')).toBe('the comment did not trigger the agent')
+    // Multica lists only agents the comment @mentions; a plain comment reaches the assignee with no outcome at all (live, #5).
+    expect(refusedOutcome([], 'ag')).toBeUndefined()
+    expect(refusedOutcome(undefined, 'ag')).toBeUndefined()
+    expect(refusedOutcome([{ status: 'queued', target_id: 'someone-else' }], 'ag')).toBeUndefined()
   })
 })
 

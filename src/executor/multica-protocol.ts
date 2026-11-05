@@ -158,12 +158,13 @@ export function planDelivery(runs: readonly RunView[]): { kind: 'steer'; runId: 
 const ACCEPTED_OUTCOMES = new Set(['steered', 'queued', 'coalesced', 'started', 'dispatched'])
 /**
  * Whether a posted comment reached the agent, from the `trigger_outcomes` Multica returns for it: `undefined` when it
- * did, else the outcomes that say why not, such as `blocked` or `deferred`.
+ * did, else the outcomes that say why not, such as `blocked` or `deferred`. Multica lists only the agents a comment
+ * @mentions: a plain comment reaches the issue's assignee with no outcome at all, so only an outcome naming the agent refuses.
  */
 export function refusedOutcome(outcomes: readonly { status?: string; reason_code?: string; target_id?: string }[] | undefined,
   agentId: string): string | undefined {
   const mine = (outcomes ?? []).filter(outcome => outcome.target_id === agentId)
-  if (!mine.length) return 'the comment did not trigger the agent'
+  if (!mine.length) return undefined
   return mine.some(outcome => ACCEPTED_OUTCOMES.has(outcome.status ?? '')) ? undefined
     : mine.map(outcome => `${outcome.status}${outcome.reason_code ? ` (${outcome.reason_code})` : ''}`).join(', ')
 }

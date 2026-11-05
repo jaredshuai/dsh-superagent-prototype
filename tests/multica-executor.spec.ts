@@ -64,7 +64,7 @@ function setup(initial: Ticket, options: { agents?: string[]; pickHealthy?: bool
       const comment = { id: `c${posted.length}`, issue_id: 'issue-1', author_type: 'member', author_id: 'operator', content, created_at: '',
         ...options.parentId ? { parent_id: options.parentId } : {} }
       comments.push(comment)
-      return { ...comment, trigger_outcomes: content.startsWith('/note') ? [] : [{ status: outcome, target_id: AGENT }] }
+      return { ...comment, trigger_outcomes: content.startsWith('/note') || outcome === 'none' ? [] : [{ status: outcome, target_id: AGENT }] }
     }),
     cancelRun: vi.fn(async () => {}),
     agents: vi.fn(async () => agents.map(agent => ({ ...agent }))),
@@ -216,6 +216,33 @@ describe('MulticaExecutor', () => {
     expect(h.engine.inputsRead).toHaveBeenCalledWith('t1', ['i1'])
   })
 
+  it('counts a plain comment as delivered though Multica names no outcome for it, as for the assignee (live, #5)', async () => {
+    const h = setup(ticketWith([{ state: 'pending' }]))
+    await h.launch()
+    h.setTicket(ticketWith([{}], { inputs: [{ id: 'i1', kind: 'text', text: 'x', at: '' }], undelivered: ['i1'] } as unknown as Partial<Ticket>))
+    h.setOutcome('none')
+    await h.deliver()
+    expect(h.engine.deliveryFailed).not.toHaveBeenCalled()
+    expect(h.engine.inputsDelivered).toHaveBeenCalledWith('t1', 'a1', ['i1'])
+  })
+  it('posts waiting Inputs once when two deliveries of a ticket run at once', async () => {
+    const h = setup(ticketWith([{ state: 'pending' }]))
+    await h.launch()
+    const waiting = ticketWith([{}], { inputs: [{ id: 'i1', kind: 'text', text: 'x', at: '' }], undelivered: ['i1'] } as unknown as Partial<Ticket>)
+    h.setTicket(waiting)
+    h.engine.inputsDelivered.mockImplementation(() => { h.setTicket({ ...waiting, undelivered: [] }) })
+    await Promise.all([h.deliver(), h.deliver()])
+    expect(h.posted.filter(post => post.content.includes('x'))).toHaveLength(1)
+  })
+  it('does not post again on its own an Input whose delivery Multica refused', async () => {
+    const h = setup(ticketWith([{ state: 'pending' }]))
+    await h.launch()
+    h.setTicket(ticketWith([{}], { inputs: [{ id: 'i1', kind: 'text', text: 'x', at: '' }], undelivered: ['i1'],
+      delivery: { error: 'Multica did not take the message: blocked', at: '' } } as unknown as Partial<Ticket>))
+    h.enqueued.splice(0)
+    await h.executor.reconcile('t1')
+    expect(h.enqueued.filter(item => item.kind === 'delivery')).toEqual([])
+  })
   it('records a delivery Multica refused instead of retrying it', async () => {
     const h = setup(ticketWith([{ state: 'pending' }]))
     await h.launch()
