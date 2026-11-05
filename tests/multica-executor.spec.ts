@@ -1,7 +1,7 @@
 /** MulticaExecutor against a fake Multica API and a recording Engine. */
 import { describe, expect, it, vi } from 'vitest'
 import type { Assignment, Ticket, TicketOutcome, Trigger } from '../src/core/index.ts'
-import type { Comment, PostedComment, Run } from '../src/executor/multica-api.ts'
+import type { Comment, PostedComment, Run, SteerReceipt } from '../src/executor/multica-api.ts'
 import { MULTICA_KV, MulticaExecutor, type MulticaExecutorHost, type MulticaTicketState } from '../src/executor/multica.ts'
 import { REPORT_FENCE } from '../src/executor/multica-protocol.ts'
 
@@ -44,6 +44,8 @@ function setup(initial: Ticket, options: { agents?: string[]; pickHealthy?: bool
   const runs: Run[] = []
   const comments: Comment[] = []
   const posted: { content: string; steer?: string[]; parentId?: string }[] = []
+  /** Steer receipts by comment id, as the issue's timeline shows them. */
+  const receipts = new Map<string, SteerReceipt[]>()
   let outcome = 'queued'
   let postFailures = 0
   const engine = {
@@ -64,8 +66,16 @@ function setup(initial: Ticket, options: { agents?: string[]; pickHealthy?: bool
       const comment = { id: `c${posted.length}`, issue_id: 'issue-1', author_type: 'member', author_id: 'operator', content, created_at: '',
         ...options.parentId ? { parent_id: options.parentId } : {} }
       comments.push(comment)
+      // As Multica does: a plain comment that steers a run accepting more messages names no outcome, only a receipt; one
+      // whose run no longer accepts them is an ordinary comment.
+      const steered = runs.find(run => options.steer?.includes(run.id) && run.status === 'running' && run.can_supplement)
+      if (steered) {
+        receipts.set(comment.id, [{ task_id: steered.id, agent_id: AGENT, status: 'pending' }])
+        return { ...comment, supplements: receipts.get(comment.id)!.map(receipt => ({ ...receipt })) }
+      }
       return { ...comment, trigger_outcomes: content.startsWith('/note') || outcome === 'none' ? [] : [{ status: outcome, target_id: AGENT }] }
     }),
+    steerReceipts: vi.fn(async () => new Map([...receipts].map(([id, list]) => [id, list.map(receipt => ({ ...receipt }))]))),
     cancelRun: vi.fn(async () => {}),
     setStatus: vi.fn(async (_issue: string, _status: string) => {}),
     agents: vi.fn(async () => agents.map(agent => ({ ...agent }))),
@@ -93,7 +103,7 @@ function setup(initial: Ticket, options: { agents?: string[]; pickHealthy?: bool
   } as unknown as MulticaExecutorHost
   let executor = new MulticaExecutor(host)
   return {
-    get executor() { return executor }, engine, api, runs, comments, posted, enqueued, health, host, agents, runtimes,
+    get executor() { return executor }, engine, api, runs, comments, posted, receipts, enqueued, health, host, agents, runtimes,
     /** Connects the event stream, or completes the reconnection `drop` started, and lets the catch-up finish. */
     connect: async () => {
       if (!sockets.length) executor.install()
@@ -207,14 +217,83 @@ describe('MulticaExecutor', () => {
     expect(h.engine.inputsRead).toHaveBeenCalledWith('t1', ['i1', 'i2'])
   })
 
-  it('steers a running run that accepts more messages, which reads them at once', async () => {
+  it('steers a running run that accepts more messages, which reads them once its daemon hands them over', async () => {
     const h = setup(ticketWith([{ state: 'pending' }]))
     await h.launch()
     h.setTicket(ticketWith([{}], { inputs: [{ id: 'i1', kind: 'text', text: 'Hurry', at: '' }], undelivered: ['i1'] } as unknown as Partial<Ticket>))
     h.runs.push({ id: 'r1', status: 'running', can_supplement: true })
-    h.setOutcome('steered')
     await h.deliver()
     expect(h.posted[0]!.steer).toEqual(['r1'])
+    expect(h.engine.deliveryFailed).not.toHaveBeenCalled()
+    expect(h.engine.inputsDelivered).toHaveBeenCalledWith('t1', 'a1', ['i1'])
+    expect(h.engine.inputsRead).not.toHaveBeenCalled()
+    h.setTicket(ticketWith([{}], { inputs: [{ id: 'i1', kind: 'text', text: 'Hurry', at: '' }], undelivered: [] } as unknown as Partial<Ticket>))
+    h.receipts.get('c1')![0]!.status = 'delivered'
+    await h.executor.reconcile('t1')
+    expect(h.engine.inputsRead).toHaveBeenCalledWith('t1', ['i1'])
+    expect(h.posted).toHaveLength(1)
+  })
+  it('posts a steer again as a plain comment when its run ended before reading it, which Multica does not replay', async () => {
+    const h = setup(ticketWith([{ state: 'pending' }]))
+    await h.launch()
+    h.setTicket(ticketWith([{}], { inputs: [{ id: 'i1', kind: 'text', text: 'Hurry', at: '' }], undelivered: ['i1'] } as unknown as Partial<Ticket>))
+    h.runs.push({ id: 'r1', status: 'running', can_supplement: true })
+    await h.deliver()
+    h.setTicket(ticketWith([{}], { inputs: [{ id: 'i1', kind: 'text', text: 'Hurry', at: '' }], undelivered: [] } as unknown as Partial<Ticket>))
+    h.runs[0]!.status = 'completed'
+    h.receipts.set('c1', [{ task_id: 'r1', status: 'failed', failure_reason: 'turn_ended' }])
+    await h.executor.reconcile('t1')
+    expect(h.posted).toHaveLength(2)
+    expect(h.posted[1]).toEqual({ content: h.posted[0]!.content })
+    expect(h.engine.inputsRead).not.toHaveBeenCalled()
+    await h.executor.reconcile('t1')
+    expect(h.posted).toHaveLength(2)
+    // The run the plain comment started reads it.
+    h.runs.unshift({ id: 'r2', status: 'running', trigger_comment_id: 'c2' })
+    await h.executor.reconcile('t1')
+    expect(h.engine.inputsRead).toHaveBeenCalledWith('t1', ['i1'])
+  })
+  it('keeps a delivery made while it settles a steer', async () => {
+    const h = setup(ticketWith([{ state: 'pending' }]))
+    await h.launch()
+    const inputs = [{ id: 'i1', kind: 'text', text: 'Hurry', at: '' }, { id: 'i2', kind: 'text', text: 'And the title', at: '' }]
+    h.setTicket(ticketWith([{}], { inputs, undelivered: ['i1'] } as unknown as Partial<Ticket>))
+    h.runs.push({ id: 'r1', status: 'running', can_supplement: true })
+    await h.deliver()
+    h.receipts.get('c1')![0]!.status = 'delivered'
+    h.setTicket(ticketWith([{}], { inputs, undelivered: ['i2'] } as unknown as Partial<Ticket>))
+    // The Engine delivers while the timeline request is out.
+    let delivering: Promise<void> | undefined
+    const receiptsNow = h.api.steerReceipts.getMockImplementation()!
+    h.api.steerReceipts.mockImplementationOnce(async () => { delivering = h.deliver(); await settle(); return receiptsNow() })
+    await h.executor.reconcile('t1')
+    await delivering
+    expect(h.state()!.deliveries.map(delivery => delivery.inputIds)).toEqual([['i1'], ['i2']])
+    expect(h.state()!.deliveries[0]).toMatchObject({ read: true })
+  })
+  it('leaves a steer to the next run when its run stopped accepting messages, as Multica then queues the comment', async () => {
+    const h = setup(ticketWith([{ state: 'pending' }]))
+    await h.launch()
+    h.setTicket(ticketWith([{}], { inputs: [{ id: 'i1', kind: 'text', text: 'Hurry', at: '' }], undelivered: ['i1'] } as unknown as Partial<Ticket>))
+    h.runs.push({ id: 'r1', status: 'running', can_supplement: true })
+    // The run ends between reading the runs and posting: the comment binds to no run and queues one.
+    h.api.addComment.mockImplementationOnce(async (_issue: string, content: string, options: { steer?: string[] } = {}) => {
+      h.posted.push({ content, ...options })
+      const comment = { id: 'c1', issue_id: 'issue-1', author_type: 'member', author_id: 'operator', content, created_at: '' }
+      h.comments.push(comment)
+      h.runs[0]!.status = 'completed'
+      h.runs.unshift({ id: 'r2', status: 'queued', trigger_comment_id: 'c1' })
+      return { ...comment, trigger_outcomes: [] }
+    })
+    await h.deliver()
+    expect(h.engine.deliveryFailed).not.toHaveBeenCalled()
+    expect(h.engine.inputsDelivered).toHaveBeenCalledWith('t1', 'a1', ['i1'])
+    h.setTicket(ticketWith([{}], { inputs: [{ id: 'i1', kind: 'text', text: 'Hurry', at: '' }], undelivered: [] } as unknown as Partial<Ticket>))
+    await h.executor.reconcile('t1')
+    expect(h.posted).toHaveLength(1)
+    expect(h.engine.inputsRead).not.toHaveBeenCalled()
+    h.runs[0]!.status = 'running'
+    await h.executor.reconcile('t1')
     expect(h.engine.inputsRead).toHaveBeenCalledWith('t1', ['i1'])
   })
 

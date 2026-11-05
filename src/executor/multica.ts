@@ -69,7 +69,7 @@ export interface MulticaTicketState {
   /** The Assignment the issue's worker reports for now, with the nonce its reports must carry. */
   assignment?: { id: string; nonce: string }
   /** Comments that carried Inputs, and whether a run has taken them in. */
-  deliveries: { commentId: string; inputIds: string[]; assignmentId: string; read?: boolean }[]
+  deliveries: Delivery[]
   /** Agent comments already processed for report blocks. */
   seen: string[]
   /** The last status seen per run. */
@@ -80,6 +80,12 @@ export interface MulticaTicketState {
   refusals?: Refusal[]
   /** The status the issue was closed with when its ticket ended; a woken ticket reopens it. */
   closed?: IssueEnd
+}
+/** A comment that carried Inputs to the issue's runs. */
+export interface Delivery {
+  commentId: string; inputIds: string[]; assignmentId: string; read?: boolean
+  /** The running run the comment was steered into, while its daemon is still to hand it over. */
+  steeredRun?: string
 }
 /** A refused report block: the `index`th block of an agent comment, and the note that tells its worker why. */
 export interface Refusal { commentId: string; index: number; note: string }
@@ -110,7 +116,7 @@ export interface MulticaExecutorHost {
   readonly machine: { stateDir: string }
   readonly lifetime: AbortSignal
   readonly config: MulticaExecutorConfig
-  readonly api: Pick<MulticaApi, 'createIssue' | 'setMetadata' | 'findIssues' | 'runs' | 'comments' | 'addComment' | 'cancelRun' | 'setStatus' | 'agents' | 'runtimes'>
+  readonly api: Pick<MulticaApi, 'createIssue' | 'setMetadata' | 'findIssues' | 'runs' | 'comments' | 'steerReceipts' | 'addComment' | 'cancelRun' | 'setStatus' | 'agents' | 'runtimes'>
   /** Builds the event stream's sockets; tests pass their own. */
   readonly socketFactory?: SocketFactory
   closing(): boolean
@@ -347,9 +353,12 @@ export class MulticaExecutor implements Executor {
     this.host.store.delete(MULTICA_KV.waiting(ticketId))
   }
 
-  /** Delivers one ticket at a time, so the Engine's delivery and a reconciliation's never post the same Inputs twice. */
-  private deliverQueued(ticketId: string): Promise<void> {
-    const next = (this.delivering.get(ticketId) ?? Promise.resolve()).then(() => this.deliverNow(ticketId))
+  /**
+   * Delivers one ticket at a time, so the Engine's delivery, a reconciliation's and a steer posted again never post the
+   * same Inputs twice or lose each other's records.
+   */
+  private deliverQueued(ticketId: string, work: () => Promise<void> = () => this.deliverNow(ticketId)): Promise<void> {
+    const next = (this.delivering.get(ticketId) ?? Promise.resolve()).then(work)
     const tracked: Promise<void> = next.catch(() => {}).finally(() => { if (this.delivering.get(ticketId) === tracked) this.delivering.delete(ticketId) })
     this.delivering.set(ticketId, tracked)
     return next
@@ -380,11 +389,16 @@ export class MulticaExecutor implements Executor {
       const posted = await this.host.api.addComment(state.issueId, inputComment(messages), plan.kind === 'steer' ? { steer: [plan.runId] } : {})
       const refused = refusedOutcome(posted.trigger_outcomes ?? undefined, this.agentOf(state))
       if (refused) { this.host.engine.deliveryFailed(ticketId, assignment.id, `Multica did not take the message: ${refused}`); return }
-      const steered = (posted.trigger_outcomes ?? []).some(outcome => outcome.status === 'steered')
+      // A plain comment that steered names no outcome, only a receipt; without one it is an ordinary comment that Multica
+      // queued for the next run, as when the run ended or stopped accepting messages before the comment reached it.
+      const steerRun = plan.kind === 'steer' ? plan.runId : undefined
+      const receipt = steerRun ? posted.supplements?.find(item => item.task_id === steerRun && item.status !== 'failed') : undefined
+      const read = receipt?.status === 'delivered'
       const saved = this.state(ticketId) ?? state
-      this.save(ticketId, { ...saved, deliveries: [...saved.deliveries, { commentId: posted.id, inputIds, assignmentId: assignment.id, read: steered }] })
+      this.save(ticketId, { ...saved, deliveries: [...saved.deliveries,
+        { commentId: posted.id, inputIds, assignmentId: assignment.id, read, ...receipt && !read ? { steeredRun: steerRun } : {} }] })
       this.host.engine.inputsDelivered(ticketId, assignment.id, inputIds)
-      if (steered) this.host.engine.inputsRead(ticketId, inputIds)
+      if (read) this.host.engine.inputsRead(ticketId, inputIds)
     } catch (error) {
       if (this.host.closing()) throw error
       this.host.engine.deliveryFailed(ticketId, assignment.id, String(error))
@@ -456,6 +470,7 @@ export class MulticaExecutor implements Executor {
     this.save(ticketId, { ...fresher, deliveries: deliveries.slice(-HISTORY_LIMIT), seen: [...fresher.seen, ...fresh.map(comment => comment.id)].slice(-SEEN_LIMIT),
       runs: statuses, refusals: [...fresher.refusals ?? [], ...refused].slice(-HISTORY_LIMIT) })
     await this.answerRefusals(ticketId, comments)
+    if (this.state(ticketId)?.deliveries.some(delivery => delivery.steeredRun)) await this.deliverQueued(ticketId, () => this.settleSteers(ticketId, comments))
     const live = this.host.store.tickets.get(ticketId)
     const assignment = live && liveTicket(live) ? runningAssignment(live) : undefined
     if (!assignment) return
@@ -468,6 +483,53 @@ export class MulticaExecutor implements Executor {
     }
     // A delivery Multica refused waits for the next Input or a retry; delivering it again here would post it on every event.
     if (live!.undelivered.length && !live!.delivery && !runs.some(run => WAITING_STATUSES.has(run.status))) this.deliver(live!, assignment)
+  }
+  /**
+   * Follows the comments steered into running runs: a run's daemon handing one over reads its Inputs; one whose run ended
+   * first is posted again as a plain comment for the next run, since Multica leaves a member's failed steer to its author.
+   * Runs in the ticket's delivery queue, so it sees every delivery recorded before it and posts no comment beside one.
+   */
+  private async settleSteers(ticketId: string, comments: readonly Comment[]): Promise<void> {
+    const state = this.state(ticketId)
+    const steered = state?.deliveries.filter(delivery => delivery.steeredRun) ?? []
+    if (!state || !steered.length) return
+    const [receipts, runs] = await Promise.all([this.host.api.steerReceipts(state.issueId), this.host.api.runs(state.issueId)])
+    const ticket = this.host.store.tickets.get(ticketId)
+    const assignment = ticket && liveTicket(ticket) ? runningAssignment(ticket) : undefined
+    const waiting = runs.some(run => WAITING_STATUSES.has(run.status))
+    /** What each settled steer becomes: its delivery read, a plain delivery posted in its place, or nothing. */
+    const settled = new Map<string, Delivery | undefined>()
+    for (const delivery of steered) {
+      const receipt = receipts.get(delivery.commentId)?.find(item => item.task_id === delivery.steeredRun)
+      if (receipt?.status === 'delivered') {
+        this.host.engine.inputsRead(ticketId, delivery.inputIds)
+        const { steeredRun: _, ...rest } = delivery
+        settled.set(delivery.commentId, { ...rest, read: true })
+        continue
+      }
+      // Pending until the run's daemon takes it or the run ends, which marks it failed in the same transaction.
+      const runEnded = ENDED_STATUSES.has(runs.find(run => run.id === delivery.steeredRun)?.status ?? 'completed')
+      if (receipt ? receipt.status !== 'failed' : !runEnded) continue
+      const content = comments.find(comment => comment.id === delivery.commentId)?.content
+      // Inputs of an Assignment that no longer runs are not posted to the next one; nor is a comment that is gone.
+      if (assignment?.id !== delivery.assignmentId || content === undefined) { settled.set(delivery.commentId, undefined); continue }
+      // A run that waits to start would take the plain comment as a run of its own; its start reconciles again.
+      if (waiting) continue
+      try {
+        const posted = await this.host.api.addComment(state.issueId, content)
+        settled.set(delivery.commentId, { commentId: posted.id, inputIds: delivery.inputIds, assignmentId: delivery.assignmentId, read: false })
+      } catch (error) {
+        if (this.host.closing()) throw error
+        this.failure(`Posting again the messages the run ${delivery.steeredRun} ended before reading`, error)
+      }
+    }
+    const latest = this.state(ticketId) ?? state
+    const deliveries = latest.deliveries.flatMap(delivery => {
+      if (!settled.has(delivery.commentId)) return [delivery]
+      const next = settled.get(delivery.commentId)
+      return next ? [next] : []
+    })
+    this.save(ticketId, { ...latest, deliveries })
   }
   /** Records that an ended ticket's issue is to be closed and queues its reconciliation; returns whether the ticket has ended. */
   private queueCloseIfEnded(ticket: Ticket): boolean {

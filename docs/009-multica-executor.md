@@ -180,7 +180,8 @@ daemon_id 是机器级的，存在 `~/.multica/daemon.id`，CLI daemon 与桌面
 
 **对实现的影响（`deliver` 规则）**：
 
-1. issue 上有 running run 且 `can_supplement = true`：`--steer <run>` 发送，检查返回的 `trigger_outcomes`，`steered` 才算投递；返回 `queued` 等则按 3 处理。
+1. issue 上有 running run 且 `can_supplement = true`：`--steer <run>` 发送。~~检查返回的 `trigger_outcomes`，`steered` 才算投递~~——普通评论的 steer 不产生 outcome，
+   回执在 `supplements[]` 里，见第 8.3 节。
 2. issue 上已有 queued run：**不发评论**，等它开始或结束后再发（否则多排一个 run）。
 3. 否则：把 Ticket 的全部未投递 Input 合并成**一条**评论发出，记下评论 id；该 id 出现在某 run 的 `trigger_comment_id` / `delivered_comment_ids` 时调 `inputsDelivered`，该 run 进入 running 时调 `inputsRead`。
 4. 永不取消承载未投递 Input 的 queued run（会丢消息）；`stop` 取消 run 时，对应 Input 视为未投递。
@@ -212,7 +213,8 @@ daemon_id 是机器级的，存在 `~/.multica/daemon.id`，CLI daemon 与桌面
 
 - `start`：首个 Assignment 建 issue（描述 = 协议 + Assignment JSON，触发消息全文内联，因为远端读不了 Ticket 资源），metadata 写 `superagent_ticket`；
   之后的 Assignment（重试等）在同一 issue 发一条后续 Assignment 评论，带新 nonce，并把当时已有的 run 记为基线。
-- `deliver`：按第 7.1 节规则；成功发出评论即 `inputsDelivered`，带它的 run 开始运行时 `inputsRead`（steer 成功时立即 `inputsRead`）；
+- `deliver`：按第 7.1 节规则；成功发出评论即 `inputsDelivered`，带它的 run 开始运行时 `inputsRead`；steer 进 run 的，等 daemon 交付（回执 `delivered`）时 `inputsRead`，
+  run 先结束了（回执 `failed`）就把原评论内容作为普通评论再发一次（第 8.3 节）；
   Multica 返回 `blocked` / `deferred` 等不重试，记 `deliveryFailed`。
 - 对账（每个 Ticket 串行）：由 WebSocket 事件触发，每次（重）连接对所有有 issue 的未结束 Ticket 补一次。先处理新的 agent 评论里的回报块，
   再看 run：issue 上不再有活跃 run 且出现新结束的 run（不含本执行器取消的）⇒ `turnEnded`；最后一个是 `failed` 则先记 `failed` 回报。
@@ -254,7 +256,7 @@ daemon_id 是机器级的，存在 `~/.multica/daemon.id`，CLI daemon 与桌面
 1. ~~回报被拒只记在 `worker` 健康项里~~：已做，见上「回报被拒的反馈」与第 8.1 节。
 2. ~~多候选 agent~~：已做，见上「多候选」。跨机故障转移与改派（第 4 节第 2、2b 层）还没做（#8）。
 3. ~~线上端到端联调~~：GitHub 与飞书私聊入口都已跑通到 PR 合并、Ticket 结束，见第 8.2 节。
-4. 第 7 节第 5、6 项（各 runtime 对协议的遵从度 #7、MCP 注入），以及 steer 投递路径的实测（#6）。
+4. 第 7 节第 5、6 项（各 runtime 对协议的遵从度 #7、MCP 注入），以及 steer 投递路径的线上实测（#6：源码结论与修复见第 8.3 节，线上一轮待跑）。
 5. ~~Ticket 结束时关闭 issue~~：已做（#9），见上「Ticket 结束时关闭 issue」。
 
 ### 8.1 反馈评论会不会引出新 run
@@ -342,10 +344,44 @@ PR #8 的作者与提交作者都是 `jaredwtt1203`。
 - 远端 Worker 对重复投递很「诚实」（回报里写「第 N 次重复投递」），但每轮仍是完整的 run，费用照算：投递必须一次准确。
 
 - 放宽 `refusedOutcome` 的代价：评论确实没触发任何 run（如 issue 被取消指派）时会被记为已投递，只剩 `deliveries[].read` 一直为 false；
-  steer 投递若没有 outcome 也会被当作成功（本次 runtime 不能 steer，未实测）。
+  steer 投递若没有 outcome 也会被当作成功（本次 runtime 不能 steer，未实测）。——已查清并修复，见第 8.3 节。
 
 - ~~Ticket 结束（停止或 PR 合并）时 Multica issue 不会关闭（JAR-53/54/55 仍是 in_review / todo），工作区里会积累活跃 issue。~~
   已做（#9），见第 8 节「Ticket 结束时关闭 issue」。改状态的请求体取自 multica CLI 0.8.0 对本地假服务器发出的请求；
   同样的请求（CLI `--no-start`）已把 JAR-53/54/55 关掉且没起 run，但执行器自己的关闭还没在线上走过。
 
 **还没验证**：重启中的 run 正常结束（那个 run 因 jxccs 上 opencode 免费额度用完而 failed，但重启本身没有打断它）。
+
+## 8.3 steer 投递路径（#6）
+
+**源码结论（multica `3a0fed5`，`server/internal/handler/comment.go`、`task_supplement.go`、`daemon.go`、`pkg/db/queries/supplement.sql`、`comment.sql`）：**
+
+- 执行器发的是**不带 @ 的普通评论**加 `steer_task_ids`。`trigger_outcomes` 只列显式 @ 的目标（`commentTriggerOutcomes`），所以 steer 成功时
+  **没有 `steered` outcome**；回执在响应的 `supplements[]`（`task_id` / `status` / `failure_reason`）里。v1 按 outcome 判 steer，永远判不出来：
+  投递记为「已投递、未读」，而 steer 进去的评论不是任何 run 的 `trigger_comment_id`，于是永远不会记为已读（缺陷 7）。
+- 绑定（`BindCommentTaskSupplement`）在同一事务里锁住 run，要求 run 仍是 `running`、协商过 `task-supplement-v1`、provider 是
+  `codex` / `claude` / `grok` / `cursor` / `kiro`。绑不上（run 已结束或不接受补充消息）时评论走**普通触发**：排一个后续 run，回执为空——消息不丢，
+  执行器已有的「后续 run 的 `trigger_comment_id` 命中即已读」照常生效。
+- **限额只管 agent 发的 steer**（每个 run 共 10 条、每个 agent 3 条，`maxAgentSteersPerTurn`）；执行器用操作者的 `mul_` token 发评论，作者是 member，**不受限额**。
+  所以「超出限额」这一退路对执行器不会出现。
+- 回执状态：`pending` → `delivering`（daemon 认领）→ `delivered`（provider 收下，`comment:updated` 推送带回执）；run 先结束则 `failed` / `turn_ended`。
+  **member 发的 steer 交付失败后 Multica 不会重放**（`ListReconcilableCommentsForIssueSince`：「failed delivery must not become an automatic new run,
+  because the member sees the failure and can retry」），只有 agent 发的才重放。也就是说 run 恰好在绑定之后、daemon 认领之前结束，消息就丢了（缺陷 8）。
+  反过来，交付成功的 steer 评论也不会在 run 结束时被重放成新 run——不会多排 run。
+
+**修复（带测试）：**
+
+- `deliver`：steer 是否成功看 `supplements[]` 里该 run 的回执；有回执记 `steered: <run>`，`inputsDelivered`，但 `inputsRead` 等回执变为 `delivered`
+  （与 DshExecutor「Session 把消息带进一步才算已读」一致；设计时写的「steer 成功立即已读」改为此）。
+- 对账：有未结的 steer 投递（`deliveries[].steeredRun`）时，在该 Ticket 的投递队列里（与 `deliver` 串行，不并发发评论、不互相覆盖记录）取一次
+  `GET /api/issues/<id>/timeline`（评论列表不带回执）和 runs。`delivered` ⇒ `inputsRead`；`failed`，或没有回执且那个 run 已结束 ⇒
+  把原评论内容作为普通评论再发一次（issue 上有排队 run 时先等），换成新评论的普通投递记录，由后续 run 读走。属于已不在运行的 Assignment 的、
+  原评论已不在的，丢掉记录不再发。回执靠 `comment:updated` 推送触发对账，不轮询（ADR 0002）。
+  代价：timeline 截断（单 issue 超过约 2000 条评论/活动）时回执可能取不到，run 已结束就会误补发一次。
+
+**线上实测：待跑。** 需要在 Multica 工作区建一个绑定 jxccs 上 Claude runtime 的测试 agent（如 `multica agent copy <superagent-worker-jxccs-codebuddy>
+--runtime-id <Claude (jxccs)> --model sonnet --name superagent-worker-jxccs-claude`），把服务器的 `MULTICA_AGENT_IDS` 指向它，部署本修复后：
+
+1. 发一个要跑一两分钟的需求；run 进行中追加一条消息。期望：投递评论的响应带 `supplements[].status = pending`，issue 上没有多出排队 run，
+   回执随后变为 `delivered`，Ticket 上该 Input 记为已读，Worker 在同一个 run 里回应。
+2. run 快结束时再追加一条，争取落到「绑定后、交付前 run 结束」：期望回执 `failed` / `turn_ended`，执行器补发一条普通评论，起一个后续 run 读到它。

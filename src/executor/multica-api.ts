@@ -1,6 +1,6 @@
 /**
  * REST client for the Multica server, limited to what MulticaExecutor uses: issues with metadata and status, their runs and
- * comments, cancelling a run, and the workspace's agents and runtimes. Every request carries the workspace as a query parameter, which the server requires.
+ * comments (and the steer receipts of its timeline), cancelling a run, and the workspace's agents and runtimes. Every request carries the workspace as a query parameter, which the server requires.
  */
 import { z } from 'zod'
 
@@ -29,9 +29,17 @@ export type Comment = z.infer<typeof CommentSchema>
 const IssueSchema = z.object({ id: z.string(), identifier: z.string().nullish(), status: z.string().nullish(), assignee_id: z.string().nullish(),
   metadata: z.record(z.string(), z.unknown()).nullish() }).passthrough()
 export type Issue = z.infer<typeof IssueSchema>
+/**
+ * A comment's receipt for one running run it steered: `pending` or `delivering` until the run's daemon hands it over,
+ * then `delivered`, or `failed` (such as `turn_ended`, when the run ended first).
+ */
+const SteerReceiptSchema = z.object({ task_id: z.string(), agent_id: z.string().nullish(), status: z.string(),
+  failure_reason: z.string().nullish(), delivered_at: z.string().nullish() }).passthrough()
+export type SteerReceipt = z.infer<typeof SteerReceiptSchema>
 const PostedCommentSchema = CommentSchema.extend({
   trigger_outcomes: z.array(z.object({ status: z.string().optional(), reason_code: z.string().optional(), target_id: z.string().optional() })
-    .passthrough()).nullish() })
+    .passthrough()).nullish(),
+  supplements: z.array(SteerReceiptSchema).nullish() })
 export type PostedComment = z.infer<typeof PostedCommentSchema>
 
 const AgentSchema = z.object({ id: z.string(), status: z.string(), runtime_id: z.string().nullish(), archived_at: z.string().nullish() })
@@ -91,6 +99,12 @@ export class MulticaApi {
   }
   comments(issueId: string, signal?: AbortSignal): Promise<Comment[]> {
     return this.request('GET', `/api/issues/${encodeURIComponent(issueId)}/comments`, z.array(CommentSchema), undefined, signal)
+  }
+  /** The steer receipts of an issue's comments, by comment id; only the issue's timeline carries them, not its comment list. */
+  async steerReceipts(issueId: string, signal?: AbortSignal): Promise<Map<string, SteerReceipt[]>> {
+    const entries = await this.request('GET', `/api/issues/${encodeURIComponent(issueId)}/timeline`,
+      z.array(z.object({ type: z.string(), id: z.string(), supplements: z.array(SteerReceiptSchema).nullish() }).passthrough()), undefined, signal)
+    return new Map(entries.flatMap(entry => entry.type === 'comment' && entry.supplements?.length ? [[entry.id, entry.supplements] as const] : []))
   }
   /** Posts a comment; with `steer`, into those running runs instead of a follow-up run where they accept it. */
   addComment(issueId: string, content: string, options: { parentId?: string; steer?: string[] } = {}, signal?: AbortSignal): Promise<PostedComment> {
