@@ -1,6 +1,6 @@
 /**
- * REST client for the Multica server, limited to what MulticaExecutor uses: issues with metadata, their runs and comments,
- * and cancelling a run. Every request carries the workspace as a query parameter, which the server requires.
+ * REST client for the Multica server, limited to what MulticaExecutor uses: issues with metadata and status, their runs and
+ * comments, cancelling a run, and the workspace's agents and runtimes. Every request carries the workspace as a query parameter, which the server requires.
  */
 import { z } from 'zod'
 
@@ -61,8 +61,10 @@ export class MulticaApi {
     if (!response.ok) throw new MulticaError(`Multica ${method} ${url.pathname} returned ${response.status}: ${text.slice(0, 300)}`, response.status)
     return schema.parse(text ? JSON.parse(text) : null)
   }
-  /** Creates an issue assigned to `agentId`, which starts its first run. */
-  /** Creates one ticket's issue; another active issue may carry the same title, which Multica refuses unless told it is meant. */
+  /**
+   * Creates one ticket's issue assigned to `agentId`, which starts its first run; another active issue may carry the same
+   * title, which Multica refuses unless told it is meant.
+   */
   createIssue(input: { title: string; description: string; agentId: string }, signal?: AbortSignal): Promise<Issue> {
     return this.request('POST', '/api/issues', IssueSchema,
       { title: input.title, description: input.description, assignee_id: input.agentId, assignee_type: 'agent', allow_duplicate: true }, signal)

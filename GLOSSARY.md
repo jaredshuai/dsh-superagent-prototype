@@ -30,7 +30,7 @@ _Avoid_: 远程 Session、执行机
 ## Assignment 在 Multica 上的样子
 
 **Ticket issue**：
-一个 Ticket 在 Multica 上对应的 issue，跨该 Ticket 的所有 Assignment 复用。
+一个 Ticket 在 Multica 上对应的 issue，跨该 Ticket 的所有 Assignment 复用。Ticket 结束时按结局改为 `done` 或 `cancelled`，Ticket 被唤醒时重开。
 _Avoid_: 任务、工单 issue
 
 **Run**：

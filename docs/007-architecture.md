@@ -353,7 +353,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/app/views/overview.ts` | The overview: Tickets that need a person, problems, the last day's flow and the Executor's load |
 | `src/executor/dsh.ts` | The DshExecutor, `WorkerSlots`, `ticketExecution`, `inputMessage` and `mandateInstructions` |
 | `src/executor/multica.ts` | The MulticaExecutor, selected with `SUPERAGENT_EXECUTOR=multica`: Assignments as Multica issues run on the operator's machines (see 009 MulticaExecutor), and `multicaConfigFromEnv` |
-| `src/executor/multica-api.ts` | `MulticaApi`, the REST calls the MulticaExecutor makes: issues and their metadata, runs, comments, cancelling a run, the workspace's agents and runtimes |
+| `src/executor/multica-api.ts` | `MulticaApi`, the REST calls the MulticaExecutor makes: issues, their metadata and status, runs, comments, cancelling a run, the workspace's agents and runtimes |
 | `src/executor/multica-candidates.ts` | `MulticaCandidates`, which configured candidate Multica agent can take a new ticket, from a snapshot of the workspace's agents and runtimes |
 | `src/executor/multica-events.ts` | `MulticaEvents`, the Multica workspace event stream over WebSocket, with reconnection and a catch-up call on every connection |
 | `src/executor/multica-protocol.ts` | The comment protocol with remote workers: the issue description, Input comments, `superagent-report` blocks and `planDelivery` |
@@ -420,8 +420,8 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `tests/background.spec.ts` | Waiting for a worker's shell jobs and subagents: an end that woke it, and a host that stops |
 | `tests/bundle-patch.spec.ts` | The bundle's patch, read as DeepSeek Harness reads it, and the agent preset of Executor Sessions it defines |
 | `tests/multica-protocol.spec.ts` | The comment protocol with remote Multica workers: report blocks and their envelope, the issue description, Input comments and the delivery plan |
-| `tests/multica-executor.spec.ts` | `MulticaExecutor` on a fake Multica API and event stream: launching as an issue, reports, turn ends, failed runs, coalesced and steered deliveries, later Assignments, stopping, and picking a healthy candidate agent or waiting for one |
-| `tests/multica-api.spec.ts` | `MulticaApi`: the request that creates a ticket's issue, which allows an active issue of the same title |
+| `tests/multica-executor.spec.ts` | `MulticaExecutor` on a fake Multica API and event stream: launching as an issue, reports, turn ends, failed runs, coalesced and steered deliveries, later Assignments, stopping, closing the issue when its ticket ends (and reopening it when the ticket is woken), and picking a healthy candidate agent or waiting for one |
+| `tests/multica-api.spec.ts` | `MulticaApi`: the request that creates a ticket's issue, which allows an active issue of the same title, and the status change that starts no run |
 | `tests/multica-config.spec.ts` | `multicaConfigFromEnv`: the single agent and the ordered candidate list, and what is missing |
 | `tests/multica-events.spec.ts` | `MulticaEvents`: first-frame auth, event deduplication, reconnection with backoff and a catch-up on every connection |
 | `tests/effects.spec.ts` | The effect queue: coalescing, limits, retries with backoff, health and shutdown |

@@ -1,6 +1,6 @@
 # 009 MulticaExecutor 设计稿（草案）
 
-> 状态：草案，2026-11-05。尚未实现，标注「待验证」的地方需先做实测。
+> 状态：v1 已实现并在线上跑通（2026-11-05），现状以第 8 节为准；第 1–7 节是设计时的方案与 spike 记录，与第 8 节不一致处以第 8 节为准。
 > 目标：让 dsh-superagent 的 Ticket 不在云端本机执行，而是经 Multica 派到操作者自己的工作站（BYOM），
 > 对应设计文章第 5 节「算力、状态、环境分离」。
 
@@ -12,7 +12,7 @@
 | --- | --- | --- |
 | `start(ticket, assignment)` | 起 `worker-<id>` 本机 dsh 会话 + prepare 目录 | 建 Multica issue，metadata 写 `superagent_ticket` / `superagent_assignment`，指派给选定的 agent（= 某台机器上的某个 runtime） |
 | `deliver(ticket, assignment)` | `sessions.prompt(..., 'steer')` 注入运行中的会话 | 活跃 run 且 `can_supplement`：`comment add --steer <run>`；否则把所有未投递 Input **合并成一条**普通评论，且只在 issue 上没有 queued run 时才发（见第 7 节 spike 结论） |
-| `stop(ticket, assignment, reason)` | 取消会话 turn、杀后台 job | `issue cancel-task` |
+| `stop(ticket, assignment, reason)` | 取消会话 turn、杀后台 job | 取消 issue 上的活跃 run；Ticket 已结束时再把 issue 改为 `done` / `cancelled`（第 8 节） |
 
 Engine 回调（`assignmentStarted` / `inputsDelivered` / `inputsRead` / `turnEnded` / `report` / `deliveryFailed`）
 由 MulticaExecutor 内部的事件处理产生：实时靠 WebSocket 推送，连接建立/重连时 REST 补齐一次 run 状态与 run-messages（`since` 游标续传），见第 6 节。
@@ -64,6 +64,7 @@ DshExecutor 的 Worker 通过会话内的宿主工具与 Engine 交互（`src/ap
 | Ticket | issue（metadata 反查） | 一个 Ticket 一个 issue，跨 Assignment 复用 |
 | Assignment | issue 上的一串 run | 新 Assignment（retry / restart）= 取消旧 run 后重新触发 |
 | Worker turn | 一个 run | run `completed` 且无回报 ⇒ `turnEnded` ⇒ `waiting` |
+| Ticket 结束 | issue 改为 `done`（completed / merged）或 `cancelled`（closed / dropped / stopped） | 被唤醒的 Ticket 发新 Assignment 前把 issue 改回 `todo`（#9） |
 | Input 投递 | 评论 / `--steer` | steer 只对支持的 runtime 有效（见第 7 节）；不支持时每条评论各自排一个 run，必须合并 |
 | `inputsDelivered` | 投递评论的 id 出现在某个 run 的 `trigger_comment_id` / `delivered_comment_ids` 里 | 发评论成功 ≠ 已投递 |
 | `inputsRead` | 上述 run 进入 `running` | 粗粒度，足够 |
@@ -223,7 +224,8 @@ daemon_id 是机器级的，存在 `~/.multica/daemon.id`，CLI daemon 与桌面
   重试 Ticket（`retried`）时 Ticket 未结束，只取消 run，不关 issue。
   已关闭的 issue 状态记在 Ticket 状态的 `closed` 里：结束的 Ticket 被人的新消息唤醒时，`start` 撤掉还没完成的关闭，新 Assignment 发评论前先把 issue
   改回 `todo`（同样 `suppress_run`，run 由评论触发）。往已有 issue 发后续 Assignment 的评论期间 Ticket 结束的话，评论发出后再关一次，取消它起的 run。
-  只处理本改动之后结束的 Ticket：之前已结束的（如 JAR-53/54/55）不会补关，需要手动 `multica issue status <id> done|cancelled --no-start`。
+  只处理这项改动上线后结束的 Ticket；更早结束的 issue 不会补关，要手动 `multica issue status <id> done|cancelled --no-start`
+  （#5 留下的 JAR-53/55 已改为 `done`、JAR-54 已改为 `cancelled`，2026-11-05）。
 - 回报被拒的反馈：配置的 agent 发出的回报块被拒时（不是 JSON / 缺字段 / 字段不合 schema、assignment 不是当前的、nonce 不对、
   PR 认领被拒、Engine 抛错），在那条评论下回复一条 `/note superagent: report block N in this comment was refused: <原因>…`，
   原因里出现的 nonce 一律替换成 `<nonce>`。PR 认领被拒时整条回报不记（与 DshExecutor 的 `orchestrator_report` 一致）。
@@ -250,9 +252,10 @@ daemon_id 是机器级的，存在 `~/.multica/daemon.id`，CLI daemon 与桌面
 **还没做**：
 
 1. ~~回报被拒只记在 `worker` 健康项里~~：已做，见上「回报被拒的反馈」与第 8.1 节。
-2. ~~多候选 agent~~：已做，见上「多候选」。跨机故障转移与改派（第 4 节第 2、2b 层）还没做。
+2. ~~多候选 agent~~：已做，见上「多候选」。跨机故障转移与改派（第 4 节第 2、2b 层）还没做（#8）。
 3. ~~线上端到端联调~~：GitHub 与飞书私聊入口都已跑通到 PR 合并、Ticket 结束，见第 8.2 节。
-4. 第 7 节第 5、6 项（各 runtime 对协议的遵从度、MCP 注入）。
+4. 第 7 节第 5、6 项（各 runtime 对协议的遵从度 #7、MCP 注入），以及 steer 投递路径的实测（#6）。
+5. ~~Ticket 结束时关闭 issue~~：已做（#9），见上「Ticket 结束时关闭 issue」。
 
 ### 8.1 反馈评论会不会引出新 run
 
@@ -316,7 +319,7 @@ PR #8 的作者与提交作者都是 `jaredwtt1203`。
 
 **发现的缺陷（均已修，带测试）**：
 
-1. **GitHub 通知晚到被游标越过**（`src/sources/github.ts`、`src/kv.ts`，上游代码，与 Multica 无关，偏离 ADR 0005 的「只改 multica*.ts」，应回馈上游）：通知的 `updated_at` 是 11:38:48，但 GitHub 列出它晚于下一轮游标
+1. **GitHub 通知晚到被游标越过**（`src/sources/github.ts`、`src/kv.ts`，上游代码，与 Multica 无关，偏离 ADR 0005 的「只改 multica*.ts」，应回馈上游，#11）：通知的 `updated_at` 是 11:38:48，但 GitHub 列出它晚于下一轮游标
    （轮次开始 − 5 s），之后 `since=` 再也取不到。修法：列表比游标往前多取 10 分钟，晚到的通知从那里读；窗口内已处理的通知按 id + `updated_at`
    记在 `github-notified`，原样再出现不重读。
 2. **投递被误判为失败而循环重发**（`multica-protocol.ts` `refusedOutcome`）：Multica 的 `trigger_outcomes` 只列评论里**显式 @** 的 agent
@@ -325,7 +328,7 @@ PR #8 的作者与提交作者都是 `jaredwtt1203`。
 3. **对账会自动重投递已失败的投递**：真被 `blocked` 时，每个 `comment:created` 事件都会再发一条评论。修法：Ticket 带投递错误时对账不再投递。网络类失败仍由 effect 队列退避重试（成功即清掉错误）；被 Multica 明确拒收的投递要等下一条 Input、新 Assignment 或 Ticket 结束才再投。
 4. **同一 Ticket 的两次投递并发**（11:56:48 两条相同评论）：Engine 与对账各排了一次投递。修法：每个 Ticket 的投递串行执行。
 
-5. **改了环境文件、用 login shell 重启，服务仍拿旧变量**（`scripts/dsh-superagent`，上游代码）：tmux 会话还在时脚本开新窗口，窗口继承的是
+5. **改了环境文件、用 login shell 重启，服务仍拿旧变量**（`scripts/dsh-superagent`，上游代码，应回馈上游，#11）：tmux 会话还在时脚本开新窗口，窗口继承的是
    早已在跑的 tmux server 的全局环境，不是执行 `restart` 的 shell 的。修法：`start` 把自己的环境写成控制目录下 0600 的快照，窗口里的启动器读入、
    删除后 `execve` 成 dsh；PID 不变，值不上命令行，tmux 启动失败时快照也删掉。
 6. **同标题的活跃 issue 让建 issue 失败**（`multica-api.ts`）：被停掉的 Ticket 的 issue 仍是 `todo`，Multica 拒绝再建同标题的活跃 issue（409
@@ -342,6 +345,7 @@ PR #8 的作者与提交作者都是 `jaredwtt1203`。
   steer 投递若没有 outcome 也会被当作成功（本次 runtime 不能 steer，未实测）。
 
 - ~~Ticket 结束（停止或 PR 合并）时 Multica issue 不会关闭（JAR-53/54/55 仍是 in_review / todo），工作区里会积累活跃 issue。~~
-  已做（#9），见第 8 节「Ticket 结束时关闭 issue」。改状态的请求体取自 multica CLI 0.8.0 对本地假服务器发出的请求；线上未实测。
+  已做（#9），见第 8 节「Ticket 结束时关闭 issue」。改状态的请求体取自 multica CLI 0.8.0 对本地假服务器发出的请求；
+  同样的请求（CLI `--no-start`）已把 JAR-53/54/55 关掉且没起 run，但执行器自己的关闭还没在线上走过。
 
 **还没验证**：重启中的 run 正常结束（那个 run 因 jxccs 上 opencode 免费额度用完而 failed，但重启本身没有打断它）。
