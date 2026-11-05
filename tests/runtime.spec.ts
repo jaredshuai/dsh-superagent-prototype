@@ -1432,6 +1432,11 @@ it('tells the conversation that the PR merged when work a restart recovered ends
   expect(runtime.store.tickets.get(ticket.id)).not.toHaveProperty('ended')
   const id = key('pr-terminal', '42', 'feishu', JSON.stringify({ chatId: CHAT, messageId: 'om_1' }), 'merged')
   expect(runtime.store.replyStatus(id)).toBeUndefined()
+  // A report in the millisecond the recovery note reached the worker counts as made before it, so the worker reports in a later one.
+  const { deliveredAt } = runningAssignment(runtime.store.tickets.get(ticket.id)!)!
+  expect(deliveredAt).toBeDefined()
+  const delivered = Date.parse(deliveredAt!)
+  await vi.waitFor(() => expect(Date.now()).toBeGreaterThan(delivered))
   // Its ready report ends the ticket with the PR, and the conversation hears of the merge once.
   await runTool(sessionId, 'orchestrator_report', { state: 'ready', summary: 'Recovered and verified' })
   expect(runtime.store.tickets.get(ticket.id)!.ended).toMatchObject({ outcome: 'merged' })
