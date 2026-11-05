@@ -26,7 +26,7 @@ import { ENDED_STATUSES, WAITING_STATUSES, inputComment, isRefusalNote, issueDes
 
 /** Which agents run the tickets, and what every worker is told about where to work. */
 export interface MulticaExecutorConfig extends MulticaConnection {
-  /** The Multica agents a new ticket's issue may be assigned to, in order of preference: each one runtime on one machine. */
+  /** The Multica agents a new ticket's issue may be assigned to, in order of preference: each one runtime on one workstation. */
   agents: readonly string[]
   /**
    * Whether a new ticket goes to the first healthy agent and waits while none is (`MULTICA_AGENT_IDS`). Without it the
@@ -84,8 +84,8 @@ export interface Refusal { commentId: string; index: number; note: string }
 export const MULTICA_KV = {
   ticket: family<MulticaTicketState>('multica-ticket:'),
   issue: family<string>('multica-issue:'),
-  /** A ticket whose first Assignment waits for a healthy candidate, once a person has been asked to start a workstation. */
-  waiting: family<{ assignmentId: string }>('multica-waiting:'),
+  /** A ticket whose first Assignment waits for a healthy candidate, once a person has been asked to start a workstation, and what they were asked. */
+  waiting: family<{ assignmentId: string; question: string }>('multica-waiting:'),
 }
 const SEEN_LIMIT = 500
 /** How many cancelled runs, deliveries and pending refusal notes a ticket's state keeps. */
@@ -232,7 +232,8 @@ export class MulticaExecutor implements Executor {
       if (!state) {
         // An issue created before a crash, whose state was never saved, is found again by its metadata.
         const [found] = await this.host.api.findIssues({ superagent_ticket: ticketId })
-        if (found) state = { issueId: found.id, identifier: found.identifier ?? undefined, deliveries: [], seen: [], runs: {} }
+        if (found) state = { issueId: found.id, identifier: found.identifier ?? undefined, ...found.assignee_id ? { agentId: found.assignee_id } : {},
+          deliveries: [], seen: [], runs: {} }
       }
       if (!state) {
         const agentId = this.choose()
@@ -241,8 +242,8 @@ export class MulticaExecutor implements Executor {
         // Save before anything else can fail, so the run the issue started reports into a known Assignment.
         this.save(ticketId, { issueId: issue.id, identifier: issue.identifier ?? undefined, agentId, assignment: { id: assignmentId, nonce },
           deliveries: [], seen: [], runs: {} })
-        await this.host.api.setMetadata(issue.id, 'superagent_ticket', ticketId)
         this.dispatched(ticketId, agentId)
+        await this.host.api.setMetadata(issue.id, 'superagent_ticket', ticketId)
       } else {
         // Runs of earlier Assignments are the baseline: only runs that start from here on are this Assignment's turns.
         const before = await this.host.api.runs(state.issueId)
@@ -274,12 +275,10 @@ export class MulticaExecutor implements Executor {
   private wait(ticketId: string, assignmentId: string): void {
     this.waiting.add(ticketId)
     if (!this.candidates.known || this.host.store.get(MULTICA_KV.waiting(ticketId))?.assignmentId === assignmentId) return
-    this.record(ticketId, { state: 'progress', summary: 'Waiting for a Multica workstation to come online', question: this.noMachine() },
-      () => { this.host.store.set(MULTICA_KV.waiting(ticketId), { assignmentId }) })
-  }
-  private noMachine(): string {
-    return `No Multica workstation is online to run this ticket: none of the candidate agents (${this.host.config.agents.join(', ')}) `
-      + 'is online. Start one of their machines; the ticket is dispatched as soon as one is online.'
+    const question = `No Multica workstation is online to run this ticket: none of the candidate Multica agents (${this.host.config.agents.join(', ')}) `
+      + 'is online. Start one of their workstations; the ticket is dispatched as soon as one is online.'
+    this.record(ticketId, { state: 'progress', summary: 'Waiting for a Multica workstation to come online', question },
+      () => { this.host.store.set(MULTICA_KV.waiting(ticketId), { assignmentId, question }) })
   }
   /** Takes a new snapshot of the candidates' health; refreshes asked for while one runs fold into one more. */
   private refreshCandidates(): void {
@@ -292,28 +291,31 @@ export class MulticaExecutor implements Executor {
       } catch (error) { if (!this.host.closing()) this.failure('Reading Multica agent status', error) }
       if (this.refreshAgain && !this.host.closing()) { this.refreshAgain = false; return run() }
     }
-    this.refreshing = run().finally(() => { this.refreshing = undefined; this.release() })
+    this.refreshing = run().finally(() => { this.refreshing = undefined; this.requeueWaiting() })
   }
   /**
    * Queues the launches of waiting tickets again: all of them once a candidate is healthy, and those still waiting for the
    * first snapshot once there is one, so they can ask a person.
    */
-  private release(): void {
+  private requeueWaiting(): void {
     if (!this.candidates.known) return
     const healthy = this.candidates.pick() !== undefined
     for (const ticketId of [...this.waiting]) {
-      if (!healthy && this.host.store.get(MULTICA_KV.waiting(ticketId))) continue
-      this.waiting.delete(ticketId)
       const ticket = this.host.store.tickets.get(ticketId)
       const latest = ticket && liveTicket(ticket) ? latestAssignment(ticket) : undefined
-      if (latest?.state === 'pending') this.start(ticket!, latest)
+      // A ticket that ended or moved on while it waited leaves nothing behind.
+      if (latest?.state !== 'pending') { this.waiting.delete(ticketId); this.host.store.delete(MULTICA_KV.waiting(ticketId)); continue }
+      if (!healthy && this.host.store.get(MULTICA_KV.waiting(ticketId))) continue
+      this.waiting.delete(ticketId)
+      this.start(ticket!, latest)
     }
   }
   /** After a waiting ticket's issue was created: withdraws the question about starting a workstation, if it is still open. */
   private dispatched(ticketId: string, agentId: string): void {
     this.waiting.delete(ticketId)
-    if (!this.host.store.get(MULTICA_KV.waiting(ticketId))) return
-    const open = this.host.store.tickets.get(ticketId)?.attention?.question === this.noMachine()
+    const asked = this.host.store.get(MULTICA_KV.waiting(ticketId))
+    if (!asked) return
+    const open = this.host.store.tickets.get(ticketId)?.attention?.question === asked.question
     if (open) this.record(ticketId, { state: 'progress', summary: `Dispatched to the Multica agent ${agentId}`, question: null })
     this.host.store.delete(MULTICA_KV.waiting(ticketId))
   }

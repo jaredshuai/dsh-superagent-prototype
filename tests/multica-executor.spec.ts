@@ -352,6 +352,26 @@ describe('MulticaExecutor', () => {
       expect(h.engine.report).toHaveBeenCalledWith('t1', { state: 'progress', summary: 'chosen' })
     })
 
+    it('finds the agent of an issue created before a crash from its assignee', async () => {
+      const h = candidates()
+      ;(h.api.findIssues as ReturnType<typeof vi.fn>).mockResolvedValueOnce([{ id: 'issue-1', identifier: 'JAR-1', assignee_id: 'a-ok' }])
+      await h.connect()
+      await h.launch()
+      expect(h.api.createIssue).not.toHaveBeenCalled()
+      expect(h.state()).toMatchObject({ issueId: 'issue-1', agentId: 'a-ok' })
+    })
+
+    it('withdraws the question even when recording the issue fails after it was created', async () => {
+      const h = allOffline()
+      await h.connect()
+      await h.launch()
+      h.agents.find(agent => agent.id === 'a-ok')!.status = 'idle'
+      h.api.setMetadata.mockRejectedValueOnce(new Error('Multica PUT failed'))
+      await h.push({ type: 'agent:status', payload: {} })
+      await h.runLaunches()
+      expect(h.host.store.tickets.get('t1')!.attention).toBeUndefined()
+    })
+
     it('assigns every ticket to the single MULTICA_AGENT_ID agent without reading health, as before', async () => {
       const h = setup(ticketWith([{ state: 'pending' }]))
       await h.connect()

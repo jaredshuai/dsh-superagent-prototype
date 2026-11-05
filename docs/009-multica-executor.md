@@ -226,6 +226,7 @@ daemon_id 是机器级的，存在 `~/.multica/daemon.id`，CLI daemon 与桌面
   任一候选恢复健康后排队的 Ticket 自动派发，派发成功后若这个问题仍挂着就以 `question: null` 撤下。
   待验证：runtime 掉线时服务端是否一定推送 `agent:status`（或别的 `runtime:` / `daemon:` 事件）。稳态下 90 s 内没有任何此类事件（2026-11-05 探针），
   只在状态变化时才有；如果某种掉线完全不推送，健康要等到下次重连才更新。
+  同理，取快照的 REST 请求失败时不重试（不轮询），记在 `worker` 健康项里，等下一个此类事件或重连再取。
 - 重启：远端 run 不受影响，所以 `resume` 不打断 running 的 Assignment，只重新排队 pending 的启动；连接建立后的补齐会追上错过的事件。
 
 **还没做**：

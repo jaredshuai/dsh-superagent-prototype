@@ -26,7 +26,7 @@ const CommentSchema = z.object({
   parent_id: z.string().nullish(), created_at: z.string(), source_task_id: z.string().nullish(),
 }).passthrough()
 export type Comment = z.infer<typeof CommentSchema>
-const IssueSchema = z.object({ id: z.string(), identifier: z.string().nullish(), status: z.string().nullish(),
+const IssueSchema = z.object({ id: z.string(), identifier: z.string().nullish(), status: z.string().nullish(), assignee_id: z.string().nullish(),
   metadata: z.record(z.string(), z.unknown()).nullish() }).passthrough()
 export type Issue = z.infer<typeof IssueSchema>
 const PostedCommentSchema = CommentSchema.extend({
@@ -34,10 +34,10 @@ const PostedCommentSchema = CommentSchema.extend({
     .passthrough()).nullish() })
 export type PostedComment = z.infer<typeof PostedCommentSchema>
 
-const AgentSchema = z.object({ id: z.string(), status: z.string(), runtime_id: z.string().nullish(), archived_at: z.string().nullish(),
-  name: z.string().nullish() }).passthrough()
+const AgentSchema = z.object({ id: z.string(), status: z.string(), runtime_id: z.string().nullish(), archived_at: z.string().nullish() })
+  .passthrough()
 export type Agent = z.infer<typeof AgentSchema>
-const RuntimeSchema = z.object({ id: z.string(), status: z.string(), name: z.string().nullish(), last_seen_at: z.string().nullish() }).passthrough()
+const RuntimeSchema = z.object({ id: z.string(), status: z.string() }).passthrough()
 export type Runtime = z.infer<typeof RuntimeSchema>
 
 /** A failed Multica request, with its HTTP status (0 when the request did not get a response). */
@@ -95,6 +95,6 @@ export class MulticaApi {
   }
   /** The workspace's agents, with their status and the runtime each is bound to. */
   agents(signal?: AbortSignal): Promise<Agent[]> { return this.request('GET', '/api/agents', z.array(AgentSchema), undefined, signal) }
-  /** The workspace's runtimes (one per machine and CLI), with whether each is online. */
+  /** The workspace's runtimes (one per workstation and CLI), with whether each is online. */
   runtimes(signal?: AbortSignal): Promise<Runtime[]> { return this.request('GET', '/api/runtimes', z.array(RuntimeSchema), undefined, signal) }
 }
