@@ -20,8 +20,8 @@ import { batchLine, batchOf, inputMessage, sourceTrigger, ticketExecution, trigg
 import type { Comment, MulticaApi, Run } from './multica-api.ts'
 import { MulticaEvents, type MulticaEvent, type SocketFactory } from './multica-events.ts'
 import type { MulticaConnection } from './multica-api.ts'
-import { ENDED_STATUSES, WAITING_STATUSES, inputComment, issueDescription, newNonce, parseReports, planDelivery, laterAssignmentComment,
-  refusedOutcome, type Brief, type ReportBlock } from './multica-protocol.ts'
+import { ENDED_STATUSES, WAITING_STATUSES, inputComment, isRefusalNote, issueDescription, newNonce, parseReports, planDelivery,
+  laterAssignmentComment, refusalNote, refusedOutcome, type Brief, type ReportBlock } from './multica-protocol.ts'
 
 /** Which agent runs the tickets, and what every worker is told about where to work. */
 export interface MulticaExecutorConfig extends MulticaConnection {
@@ -63,12 +63,18 @@ export interface MulticaTicketState {
   runs: Record<string, string>
   /** Runs this executor cancelled, whose end is no turn end of the worker's. */
   cancelled?: string[]
+  /** Refused report blocks whose note to the worker has not reached Multica yet. */
+  refusals?: Refusal[]
 }
+/** A refused report block: the `index`th block of an agent comment, and the note that tells its worker why. */
+export interface Refusal { commentId: string; index: number; note: string }
 export const MULTICA_KV = {
   ticket: family<MulticaTicketState>('multica-ticket:'),
   issue: family<string>('multica-issue:'),
 }
 const SEEN_LIMIT = 500
+/** How many cancelled runs, deliveries and pending refusal notes a ticket's state keeps. */
+const HISTORY_LIMIT = 50
 
 export interface MulticaExecutorHost {
   readonly engine: Pick<EngineForExecutor, 'assignmentStarted' | 'inputsDelivered' | 'inputsRead' | 'turnEnded' | 'deliveryFailed' | 'report'
@@ -95,6 +101,7 @@ export interface MulticaExecutorHost {
 }
 
 const now = () => new Date().toISOString()
+const errorText = (error: unknown) => error instanceof Error ? error.message : String(error)
 const issueOf = (event: MulticaEvent): string | undefined => {
   const payload = event.payload
   const comment = payload.comment as { issue_id?: unknown } | undefined
@@ -159,7 +166,7 @@ export class MulticaExecutor implements Executor {
   }
   private healthy(detail: string): void { this.host.health.set({ state: 'ready', detail, at: now() }) }
   private failure(what: string, error: unknown): void {
-    this.host.health.set({ state: 'error', detail: `${what}: ${error instanceof Error ? error.message : String(error)}`, at: now() })
+    this.host.health.set({ state: 'error', detail: `${what}: ${errorText(error)}`, at: now() })
   }
 
   /** The assignment a remote worker receives: what a DSH worker's first message holds, with trigger texts in full. */
@@ -215,7 +222,7 @@ export class MulticaExecutor implements Executor {
         // Runs of earlier Assignments are the baseline: only runs that start from here on are this Assignment's turns.
         const before = await this.host.api.runs(state.issueId)
         this.save(ticketId, { ...state, assignment: { id: assignmentId, nonce }, runs: Object.fromEntries(before.map(run => [run.id, run.status])),
-          cancelled: [...state.cancelled ?? [], ...before.filter(run => !ENDED_STATUSES.has(run.status)).map(run => run.id)].slice(-50) })
+          cancelled: [...state.cancelled ?? [], ...before.filter(run => !ENDED_STATUSES.has(run.status)).map(run => run.id)].slice(-HISTORY_LIMIT) })
         const posted = await this.host.api.addComment(state.issueId, laterAssignmentComment(brief))
         const refused = refusedOutcome(posted.trigger_outcomes ?? undefined, this.host.config.agentId)
         if (refused) throw new Error(`Multica did not start the agent: ${refused}`)
@@ -227,7 +234,7 @@ export class MulticaExecutor implements Executor {
     } catch (error) {
       if (this.host.closing() || error instanceof Later) throw error
       this.failure('Launching on Multica', error)
-      if (current()) this.reportFailed(ticketId, `Could not start the assignment on Multica: ${error instanceof Error ? error.message : String(error)}`)
+      if (current()) this.reportFailed(ticketId, `Could not start the assignment on Multica: ${errorText(error)}`)
     }
   }
 
@@ -274,7 +281,7 @@ export class MulticaExecutor implements Executor {
     const active = runs.filter(run => !ENDED_STATUSES.has(run.status))
     if (!active.length) return
     const state = this.state(ticketId)
-    if (state) this.save(ticketId, { ...state, cancelled: [...state.cancelled ?? [], ...active.map(run => run.id)].slice(-50) })
+    if (state) this.save(ticketId, { ...state, cancelled: [...state.cancelled ?? [], ...active.map(run => run.id)].slice(-HISTORY_LIMIT) })
     await Promise.all(active.map(run => this.host.api.cancelRun(run.id)))
   }
 
@@ -311,7 +318,8 @@ export class MulticaExecutor implements Executor {
     // Reports first, so a report and the end of the turn that made it arrive in that order.
     const fresh = comments.filter(comment => comment.author_type === 'agent' && comment.author_id === this.host.config.agentId
       && !state.seen.includes(comment.id)).sort((a, b) => a.created_at.localeCompare(b.created_at))
-    for (const comment of fresh) await this.apply(ticketId, state, comment)
+    const refused: Refusal[] = []
+    for (const comment of fresh) refused.push(...await this.apply(ticketId, state, comment))
     // A run first seen already ended started and ended between two reconciliations, such as while the stream was down.
     const ended = runs.filter(run => ENDED_STATUSES.has(run.status) && !ENDED_STATUSES.has(state.runs[run.id] ?? ''))
     const fresher = this.state(ticketId) ?? state
@@ -323,8 +331,9 @@ export class MulticaExecutor implements Executor {
       return took ? { ...delivery, read: true } : delivery
     })
     const statuses = Object.fromEntries(runs.map(run => [run.id, run.status]))
-    this.save(ticketId, { ...fresher, deliveries: deliveries.slice(-50), seen: [...fresher.seen, ...fresh.map(comment => comment.id)].slice(-SEEN_LIMIT),
-      runs: statuses })
+    this.save(ticketId, { ...fresher, deliveries: deliveries.slice(-HISTORY_LIMIT), seen: [...fresher.seen, ...fresh.map(comment => comment.id)].slice(-SEEN_LIMIT),
+      runs: statuses, refusals: [...fresher.refusals ?? [], ...refused].slice(-HISTORY_LIMIT) })
+    await this.answerRefusals(ticketId, comments)
     const live = this.host.store.tickets.get(ticketId)
     const assignment = live && liveTicket(live) ? runningAssignment(live) : undefined
     if (!assignment) return
@@ -350,20 +359,48 @@ export class MulticaExecutor implements Executor {
     } catch (error) { this.failure('Recording a failure', error) }
   }
 
-  /** Applies the report blocks of one agent comment for the ticket's current Assignment. */
-  private async apply(ticketId: string, state: MulticaTicketState, comment: Comment): Promise<void> {
+  /** Applies the report blocks of one agent comment for the ticket's current Assignment; returns the blocks it refused. */
+  private async apply(ticketId: string, state: MulticaTicketState, comment: Comment): Promise<Refusal[]> {
     const assignment = state.assignment
-    if (!assignment) return
-    for (const parsed of parseReports(comment.content, { assignment: assignment.id, nonce: assignment.nonce })) {
-      if (!parsed.ok) { this.failure(`Ignored a report block in comment ${comment.id}`, parsed.error); continue }
-      try { await this.request(ticketId, parsed.block) } catch (error) { this.failure(`Report block in comment ${comment.id}`, error) }
+    if (!assignment) return []
+    const refused: Refusal[] = []
+    const refuse = (index: number, reason: string) => {
+      refused.push({ commentId: comment.id, index, note: refusalNote(index, reason, assignment.nonce) })
     }
+    for (const [index, parsed] of parseReports(comment.content, { assignment: assignment.id, nonce: assignment.nonce }).entries()) {
+      if (!parsed.ok) { this.failure(`Ignored a report block in comment ${comment.id}`, parsed.error); refuse(index, parsed.error); continue }
+      try { await this.request(ticketId, parsed.block) } catch (error) {
+        this.failure(`Report block in comment ${comment.id}`, error)
+        refuse(index, errorText(error))
+      }
+    }
+    return refused
+  }
+  /**
+   * Tells workers why their report blocks were refused, with a note under each block's comment. A refusal already
+   * answered on the issue, such as by a note posted just before a restart, is not answered again; one Multica failed to
+   * take stays pending for the next reconciliation.
+   */
+  private async answerRefusals(ticketId: string, comments: readonly Comment[]): Promise<void> {
+    const state = this.state(ticketId)
+    if (!state?.refusals?.length) return
+    const pending: Refusal[] = []
+    for (const refusal of state.refusals) {
+      if (comments.some(comment => comment.parent_id === refusal.commentId && isRefusalNote(comment.content, refusal.index))) continue
+      try { await this.host.api.addComment(state.issueId, refusal.note, { parentId: refusal.commentId }) } catch (error) {
+        if (this.host.closing()) throw error
+        this.failure(`Telling the worker about a refused report in comment ${refusal.commentId}`, error)
+        pending.push(refusal)
+      }
+    }
+    this.save(ticketId, { ...this.state(ticketId) ?? state, refusals: pending })
   }
   private async request(ticketId: string, block: ReportBlock): Promise<void> {
     const engine = this.host.engine
     if (block.tool === 'ack') {
       const reply = engine.reply({ purpose: 'acknowledgement', ticketId, triggerId: block.trigger_id, text: block.text })
-      if (reply.status !== 'sent') await this.host.sendReplies()
+      // The reply is queued either way, and the outbox retries it: a failed send now is no refusal of the block.
+      if (reply.status !== 'sent') await this.host.sendReplies().catch((error: unknown) => { this.failure('Sending a worker acknowledgement', error) })
       return
     }
     if (block.tool === 'handback') { engine.handback(ticketId, block.trigger_id, block.reason); return }
@@ -374,8 +411,9 @@ export class MulticaExecutor implements Executor {
       engine.followForContext(ticketId, { source: block.thread.slice(0, at), id: block.thread.slice(at + 1) })
       return
     }
+    // As with a DSH worker's report, a refused PR claim refuses the report it came with.
     const refused = block.pr_number != null && this.host.claimPull ? await this.host.claimPull(ticketId, block.pr_number, this.host.lifetime) : undefined
-    if (refused) this.failure(`PR #${block.pr_number} not claimed`, refused)
+    if (refused) throw new Error(`PR #${block.pr_number} was not claimed: ${refused}`)
     const report: WorkerReport = { state: block.state, summary: block.summary, ...block.human_action !== undefined ? { question: block.human_action } : {},
       ...block.question_for_trigger_id ? { askedBy: block.question_for_trigger_id } : {}, ...block.reply_to_trigger_id ? { answers: block.reply_to_trigger_id } : {} }
     this.host.store.atomic(() => {

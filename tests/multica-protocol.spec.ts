@@ -1,6 +1,6 @@
 /** The comment protocol between dsh-superagent and remote Multica workers. */
 import { describe, expect, it } from 'vitest'
-import { inputComment, issueDescription, newNonce, parseReports, planDelivery, refusedOutcome, REPORT_FENCE, type Brief }
+import { inputComment, issueDescription, isRefusalNote, newNonce, parseReports, planDelivery, refusalNote, refusedOutcome, REPORT_FENCE, type Brief }
   from '../src/executor/multica-protocol.ts'
 
 const brief: Brief = { ticketId: 't1', assignmentId: 'a1', nonce: 'n1', title: 'Fix it', assignment: '{"ticket_id":"t1"}',
@@ -61,5 +61,24 @@ describe('delivery plan', () => {
     expect(refusedOutcome([{ status: 'queued', target_id: 'ag' }], 'ag')).toBeUndefined()
     expect(refusedOutcome([{ status: 'blocked', reason_code: 'agent_paused', target_id: 'ag' }], 'ag')).toBe('blocked (agent_paused)')
     expect(refusedOutcome([], 'ag')).toBe('the comment did not trigger the agent')
+  })
+})
+
+describe('refusal notes', () => {
+  it('start with /note so Multica starts no run, name the block, and never carry the nonce', () => {
+    const note = refusalNote(1, 'the engine said n1 is wrong', 'n1')
+    expect(note.startsWith('/note ')).toBe(true)
+    expect(note).toContain('report block 2')
+    expect(note).toContain('the engine said <nonce> is wrong')
+    expect(note).not.toContain('n1')
+  })
+  it('are recognised per block, so each refused block is answered once', () => {
+    const note = refusalNote(0, 'not JSON', 'n1')
+    expect(isRefusalNote(note, 0)).toBe(true)
+    expect(isRefusalNote(note, 1)).toBe(false)
+    expect(isRefusalNote('/note something else', 0)).toBe(false)
+  })
+  it('are explained to the worker in the issue description', () => {
+    expect(issueDescription(brief)).toContain('/note superagent:')
   })
 })

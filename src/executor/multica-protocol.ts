@@ -49,6 +49,25 @@ export function parseReports(content: string, expected: { assignment: string; no
   })
 }
 
+/**
+ * The prefix of the reply that tells a worker why a report block was refused. Multica starts no run for a comment whose
+ * first token is `/note` (`isNoteComment` in its comment handler), so the reply costs no extra run; the worker reads it
+ * when it checks its report or in the comment history of its next run.
+ */
+export const REFUSAL_PREFIX = '/note superagent:'
+const blockLabel = (index: number) => `report block ${index + 1}`
+
+/** The reply under a worker's comment that says why its `index`th report block was refused; the nonce never appears in it. */
+export function refusalNote(index: number, reason: string, nonce: string): string {
+  const said = nonce ? reason.split(nonce).join('<nonce>') : reason
+  return `${REFUSAL_PREFIX} ${blockLabel(index)} in this comment was refused: ${said}. `
+    + 'Nothing in it was recorded. Fix it and post the report again in a new comment, as the issue description says.'
+}
+/** Whether a comment is the refusal note for the `index`th report block of the comment it replies to. */
+export function isRefusalNote(content: string, index: number): boolean {
+  return content.startsWith(`${REFUSAL_PREFIX} ${blockLabel(index)} `)
+}
+
 /** What a remote worker is told about its Assignment and where to work. */
 export interface Brief {
   ticketId: string
@@ -94,6 +113,7 @@ export function issueDescription(brief: Brief): string {
     '- `pr_number` names the pull request you opened from the branch above, when there is one.',
     '- Hand back a message that asks for work beyond this ticket with `{"tool":"handback","trigger_id":…,"reason":…}`; follow or drop a related thread with `{"tool":"follow"|"unrelated","thread":"github:<number>","reason":…}`.',
     '- Always end the run with a `report`; a run that ends without one counts as waiting for more input.',
+    `- A refused report block gets a reply under its comment, within seconds, that starts with \`${REFUSAL_PREFIX}\` and says why. After posting a report, list the comments (\`multica issue comment list <issue>\`); if such a reply names your block, fix it and post the report again. These replies start no run of their own.`,
     '',
     '## Assignment',
     '',

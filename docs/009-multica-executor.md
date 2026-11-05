@@ -209,11 +209,40 @@ daemon_id 是机器级的，存在 `~/.multica/daemon.id`，CLI daemon 与桌面
 - 对账（每个 Ticket 串行）：由 WebSocket 事件触发，每次（重）连接对所有有 issue 的未结束 Ticket 补一次。先处理新的 agent 评论里的回报块，
   再看 run：issue 上不再有活跃 run 且出现新结束的 run（不含本执行器取消的）⇒ `turnEnded`；最后一个是 `failed` 则先记 `failed` 回报。
 - `stop`：取消 issue 上所有活跃 run，并记入 `cancelled`，其结束不算 turn 结束。
+- 回报被拒的反馈：配置的 agent 发出的回报块被拒时（不是 JSON / 缺字段 / 字段不合 schema、assignment 不是当前的、nonce 不对、
+  PR 认领被拒、Engine 抛错），在那条评论下回复一条 `/note superagent: report block N in this comment was refused: <原因>…`，
+  原因里出现的 nonce 一律替换成 `<nonce>`。PR 认领被拒时整条回报不记（与 DshExecutor 的 `orchestrator_report` 一致）。
+  待发的反馈存在 `refusals` 里，发成功才移除，发失败下次对账再发；发之前先看 issue 上是否已有同一条评论下、同一块编号的反馈，
+  有就不再发——所以重连补齐、执行器在「已发出但未存盘」时重启，都不会重复回复。别人（不是配置的 agent）的评论从不解析，也就不回复。
+  issue 描述里告诉 Worker：发完回报后列一下评论，看到点名自己那块的 `/note superagent:` 回复就改正后重发。
 - 重启：远端 run 不受影响，所以 `resume` 不打断 running 的 Assignment，只重新排队 pending 的启动；连接建立后的补齐会追上错过的事件。
 
 **还没做**：
 
-1. 回报被拒（nonce 错、PR 认领失败、Engine 报错）只记在 `worker` 健康项里，不会反馈给 Worker。
+1. ~~回报被拒只记在 `worker` 健康项里~~：已做，见上「回报被拒的反馈」与第 8.1 节。
 2. 多候选 agent 与跨机故障转移（第 4 节）；当前只有一个固定 agent。
 3. 线上端到端联调：在服务器上设置上述环境变量，用测试 agent 跑一张真实 Ticket。
 4. 第 7 节第 5、6 项（各 runtime 对协议的遵从度、MCP 注入）。
+
+### 8.1 反馈评论会不会引出新 run
+
+**结论：以 `/note` 开头的评论不触发任何 agent，所以反馈评论用 `/note superagent:` 开头。**
+
+- 源码证据（multica `server/internal/handler/comment.go`，本地 checkout `3a0fed5`，2026-11-05）：
+  `triggerTasksForComment` 第一步 `if isNoteComment(comment.Content) { return nil }`，`computeCommentAgentTriggers` 开头同样短路；
+  `isNoteComment` 判断去掉前导空白后的第一个 token 是否（不区分大小写）等于 `/note`。所以 `/note superagent: …` 不会走
+  回复父评论作者（`routeReplyToParentAuthor`，回复 agent 评论本来会触发该 agent）、也不会走 assignee 兜底，trigger_outcomes 为空。
+- 对比：不带 `/note` 的成员评论，回复在 agent 评论下会经 `routeReplyToParentAuthor` 触发该 agent，顶层评论会经 `routeAssigneeFallback`
+  触发 assignee（第 7.1 节第 1 项实测：3 s 内进入 running）——这正是要避免的多余 run。
+- 代价：`/note` 不进 run，Worker 只能主动去看。所以描述里要求 Worker 发完回报后列一次评论；对账由 WebSocket `comment:created`
+  推送触发，反馈通常在 1–2 s 内出现。即使这一轮没看到，下一轮 run 开始时读最新评论也会看到。
+- **线上实测：待做**（本次实现时自动化环境不允许往 Multica 写评论）。在任一已结束、无活跃 run 的测试 issue（如 JAR-49）上执行：
+
+  ```sh
+  printf '/note superagent: probe — ignore.\n' | multica issue comment add JAR-49 --parent <某条 agent 评论 id> --content-stdin --output json
+  # 期望：返回的 trigger_outcomes 为空；20 s 后 multica issue runs JAR-49 的 run 数不变
+  ```
+
+  结果填回这里。若线上服务与源码不一致（`/note` 也触发了 run），退路是让 Worker 识别 `/note superagent:` 开头的触发评论后直接结束本轮（不回报），
+  并在协议说明里写明。
+

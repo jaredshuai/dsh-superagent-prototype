@@ -23,8 +23,9 @@ function setup(initial: Ticket) {
   const enqueued: { kind: string; key: string }[] = []
   const runs: Run[] = []
   const comments: Comment[] = []
-  const posted: { content: string; steer?: string[] }[] = []
+  const posted: { content: string; steer?: string[]; parentId?: string }[] = []
   let outcome = 'queued'
+  let postFailures = 0
   const engine = {
     assignmentStarted: vi.fn(), inputsDelivered: vi.fn(), inputsRead: vi.fn(), turnEnded: vi.fn(), deliveryFailed: vi.fn(),
     report: vi.fn(() => ticket), reply: vi.fn(() => ({ id: 'r', status: 'sent', reused: false })), handback: vi.fn(() => true),
@@ -37,9 +38,13 @@ function setup(initial: Ticket) {
     findIssues: vi.fn(async () => []),
     runs: vi.fn(async () => runs.map(run => ({ ...run }))),
     comments: vi.fn(async () => comments.map(comment => ({ ...comment }))),
-    addComment: vi.fn(async (_issue: string, content: string, options: { steer?: string[] } = {}): Promise<PostedComment> => {
+    addComment: vi.fn(async (_issue: string, content: string, options: { steer?: string[]; parentId?: string } = {}): Promise<PostedComment> => {
+      if (postFailures > 0) { postFailures--; throw new Error('Multica POST failed') }
       posted.push({ content, ...options })
-      return { id: `c${posted.length}`, issue_id: 'issue-1', author_type: 'member', content, created_at: '', trigger_outcomes: [{ status: outcome, target_id: AGENT }] }
+      const comment = { id: `c${posted.length}`, issue_id: 'issue-1', author_type: 'member', author_id: 'operator', content, created_at: '',
+        ...options.parentId ? { parent_id: options.parentId } : {} }
+      comments.push(comment)
+      return { ...comment, trigger_outcomes: content.startsWith('/note') ? [] : [{ status: outcome, target_id: AGENT }] }
     }),
     cancelRun: vi.fn(async () => {}),
   }
@@ -59,10 +64,15 @@ function setup(initial: Ticket) {
     socketFactory: () => { throw new Error('no sockets in tests') },
     closing: () => false, paused: () => false,
     sourceLink: async () => ({ source_url: 'https://github.com/o/r/issues/2' }), repliedTo: () => undefined, sendReplies: vi.fn(async () => {}),
+    claimPull: vi.fn(async (): Promise<string | undefined> => undefined),
   } as unknown as MulticaExecutorHost
-  const executor = new MulticaExecutor(host)
+  let executor = new MulticaExecutor(host)
   return {
-    executor, engine, api, runs, comments, posted, enqueued, health,
+    get executor() { return executor }, engine, api, runs, comments, posted, enqueued, health, host,
+    /** A new executor over the same store and Multica, as after a restart. */
+    restart: () => { executor = new MulticaExecutor(host) },
+    setState: (next: MulticaTicketState) => { kv.set(MULTICA_KV.ticket('t1'), next) },
+    failPosts: (count: number) => { postFailures = count },
     state: () => kv.get(MULTICA_KV.ticket('t1')) as MulticaTicketState | undefined,
     setTicket: (next: Ticket) => { ticket = next },
     setOutcome: (next: string) => { outcome = next },
@@ -202,5 +212,71 @@ describe('MulticaExecutor', () => {
     h.runs[0]!.status = 'cancelled'
     await h.executor.reconcile('t1')
     expect(h.engine.turnEnded).not.toHaveBeenCalled()
+  })
+
+  describe('refused report blocks', () => {
+    const notes = (h: ReturnType<typeof setup>) => h.posted.filter(item => item.content.startsWith('/note'))
+    async function running() {
+      const h = setup(ticketWith([{ state: 'pending' }]))
+      await h.launch()
+      h.setTicket(ticketWith([{}]))
+      h.runs.push({ id: 'r1', status: 'running' })
+      return { h, nonce: h.state()!.assignment!.nonce }
+    }
+
+    it('answers each refused block under its comment with why, without the nonce', async () => {
+      const { h, nonce } = await running()
+      ;(h.host.claimPull as ReturnType<typeof vi.fn>).mockResolvedValueOnce('PR #9 is not from this ticket\'s branch')
+      h.engine.report.mockImplementationOnce(() => { throw new Error('The assignment is not running') })
+      h.comments.push(
+        agentComment('k1', '```' + REPORT_FENCE + '\n{oops\n```'),
+        agentComment('k2', report({ tool: 'report', state: 'ready', summary: 'x' }, 'guess')),
+        agentComment('k3', report({ tool: 'report', state: 'ready', summary: 'x' }, nonce, 'a0')),
+        agentComment('k4', report({ tool: 'report', state: 'ready', summary: 'x', pr_number: 9 }, nonce)),
+        agentComment('k5', report({ tool: 'report', state: 'progress', summary: 'y' }, nonce)))
+      await h.executor.reconcile('t1')
+      expect(notes(h).map(note => note.parentId)).toEqual(['k1', 'k2', 'k3', 'k4', 'k5'])
+      const [json, wrongNonce, wrongAssignment, pull, engine] = notes(h).map(note => note.content)
+      expect(json).toContain('not JSON')
+      expect(wrongNonce).toContain('wrong nonce')
+      expect(wrongAssignment).toContain('a0')
+      expect(pull).toContain('PR #9 is not from this ticket')
+      expect(engine).toContain('The assignment is not running')
+      for (const note of notes(h)) expect(note.content).not.toContain(nonce)
+      // A refused PR claim refuses the report it came with.
+      expect(h.engine.report).toHaveBeenCalledTimes(1)
+      expect(h.engine.report).toHaveBeenCalledWith('t1', { state: 'progress', summary: 'y' })
+    })
+
+    it('answers a refused block once, across reconciliations and restarts', async () => {
+      const { h } = await running()
+      h.comments.push(agentComment('k1', report({ tool: 'report', state: 'ready', summary: 'x' }, 'guess')))
+      await h.executor.reconcile('t1')
+      await h.executor.reconcile('t1')
+      expect(notes(h)).toHaveLength(1)
+      // A crash after the note went out but before the comment was recorded as seen.
+      h.setState({ ...h.state()!, seen: [] })
+      h.restart()
+      await h.executor.reconcile('t1')
+      expect(notes(h)).toHaveLength(1)
+    })
+
+    it('posts a note again on the next reconciliation when Multica failed to take it', async () => {
+      const { h } = await running()
+      h.comments.push(agentComment('k1', report({ tool: 'report', state: 'ready', summary: 'x' }, 'guess')))
+      h.failPosts(1)
+      await h.executor.reconcile('t1')
+      expect(notes(h)).toHaveLength(0)
+      await h.executor.reconcile('t1')
+      expect(notes(h)).toHaveLength(1)
+    })
+
+    it('does not answer report blocks in comments the configured agent did not write', async () => {
+      const { h } = await running()
+      h.comments.push({ ...agentComment('k1', report({ tool: 'report', state: 'ready', summary: 'x' }, 'guess')), author_id: 'other-agent' },
+        { ...agentComment('k2', '```' + REPORT_FENCE + '\n{oops\n```'), author_type: 'member', author_id: 'someone' })
+      await h.executor.reconcile('t1')
+      expect(notes(h)).toEqual([])
+    })
   })
 })
