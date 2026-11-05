@@ -130,6 +130,12 @@ daemon_id 是机器级的，存在 `~/.multica/daemon.id`，CLI daemon 与桌面
 
 - prototype 让 Worker 以 Agent 账号（`gh-agent`）提交和开 PR。远端工作站默认是操作者自己的 git/gh 身份。
   需在每台工作站配同样的 `gh-agent` 包装，并在 issue 描述里要求 Worker 使用它；否则 PR 会署操作者的名。
+- **jxccs 已配置（2026-11-05，#2）**：`/home/jxccs/.local/bin/gh-agent`（gh，登录信息在 `~/.config/gh-agent`）与
+  `/home/jxccs/.local/bin/git-agent`（git：凭据走 gh-agent、清掉操作者的全局凭据助手、SSH 地址改写为 HTTPS、提交作者为 `jaredwtt1203`
+  的 noreply 邮箱）。只包 gh 不够：操作者的全局 git 配置让 github.com 凭据走自己的 gh，普通 `git push` 会以操作者身份推送。
+  用法：Worker 的所有 git 命令用 `git-agent`，所有 gh 命令用 `gh-agent`。两者都在 Multica run 的 `PATH` 上（daemon 注入的 PATH 含 `~/.local/bin`）。
+  执行用的 Multica agent 是 `superagent-worker-jxccs`（Opencode runtime），说明里写了上述规则；`failover-test-jxccs` 只是环境探针，不接真实工作。
+  实测 JAR-52：run 推送分支、开 PR，PR 作者、提交作者（已关联账号）和推送者都是 `jaredwtt1203`；探针 PR 与分支已清理。
 - Multica token 只在云端；工作站只拿到每 Assignment 的签名密钥，不拿任何云端凭据。
 
 ## 6. 去轮询：推送优先 + 断线补齐
