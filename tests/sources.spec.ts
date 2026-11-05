@@ -582,7 +582,8 @@ describe('github source', () => {
     await pollRound(h)
     const cursor = h.store.get<string>('github-since')!
     // Stamped before the cursor the previous round left, as GitHub stamps a notification it lists late.
-    const stamped = new Date(Date.parse(cursor) - 30_000).toISOString()
+    // GitHub writes whole seconds without milliseconds; the cursor has them.
+    const stamped = new Date(Date.parse(cursor) - 30_000).toISOString().replace(/\.\d+Z$/, 'Z')
     Object.assign(routes, { notifications: [{ ...notification(20), updated_at: stamped }],
       'issues/20': issue(20, { created_at: stamped, body: '@agent-bot add a file' }) })
     await pollRound(h)

@@ -306,7 +306,7 @@ async function pollNotifications(ctx: SourceContext, round: Round): Promise<{ co
   // GitHub lists a notification some time after the `updated_at` it carries, so the list reaches back further than the cursor;
   // `notified` keeps what was taken within that reach, so a notification listed again unchanged is not read again.
   const reach = new Date(Date.parse(since) - NOTIFICATION_LAG_MS).toISOString()
-  const taken = Object.fromEntries(Object.entries(state.get(KV.github.notified) ?? {}).filter(([, at]) => at >= reach))
+  const taken = Object.fromEntries(Object.entries(state.get(KV.github.notified) ?? {}).filter(([, at]) => Date.parse(at) >= Date.parse(reach)))
   const path = `notifications?all=true&per_page=50&since=${encodeURIComponent(reach)}`
   const raw = await commands.api(path, '--include')
   const split = raw.search(/\r?\n\r?\n/)
@@ -329,7 +329,7 @@ async function pollNotifications(ctx: SourceContext, round: Round): Promise<{ co
     if (!address || address.discussion || items.has(address.number)) continue
     const { number, pr } = address
     // A late notification is read from where it reaches, not from the cursor that already passed it.
-    const from = notification.updated_at < since ? reach : since
+    const from = Date.parse(notification.updated_at) < Date.parse(since) ? reach : since
     items.set(number, { since: [state.get(KV.github.cursor(number)) ?? from, from].sort().at(-1)!, pr })
   }
   for (const [number, item] of items) {

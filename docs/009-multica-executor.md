@@ -291,13 +291,13 @@ daemon_id 是机器级的，存在 `~/.multica/daemon.id`，CLI daemon 与桌面
 
 **发现的缺陷（均已修，带测试）**：
 
-1. **GitHub 通知晚到被游标越过**（`src/sources/github.ts`，上游代码）：通知的 `updated_at` 是 11:38:48，但 GitHub 列出它晚于下一轮游标
+1. **GitHub 通知晚到被游标越过**（`src/sources/github.ts`、`src/kv.ts`，上游代码，与 Multica 无关，偏离 ADR 0005 的「只改 multica*.ts」，应回馈上游）：通知的 `updated_at` 是 11:38:48，但 GitHub 列出它晚于下一轮游标
    （轮次开始 − 5 s），之后 `since=` 再也取不到。修法：列表比游标往前多取 10 分钟，晚到的通知从那里读；窗口内已处理的通知按 id + `updated_at`
    记在 `github-notified`，原样再出现不重读。
 2. **投递被误判为失败而循环重发**（`multica-protocol.ts` `refusedOutcome`）：Multica 的 `trigger_outcomes` 只列评论里**显式 @** 的 agent
    （`server/internal/handler/comment.go` `commentTriggerOutcomes`，assignee 兜底不产生 outcome），普通投递评论回来是空列表，被当成「未触发 agent」记
    `deliveryFailed`；对账见到 Input 仍未投递、又没有排队 run，就再发一次，每次都真起一个 run。修法：只有点名本 agent 的 outcome 才能判拒收。
-3. **对账会自动重投递已失败的投递**：真被 `blocked` 时，每个 `comment:created` 事件都会再发一条评论。修法：Ticket 带投递错误时对账不再投递，等下一条 Input 或重试。
+3. **对账会自动重投递已失败的投递**：真被 `blocked` 时，每个 `comment:created` 事件都会再发一条评论。修法：Ticket 带投递错误时对账不再投递。网络类失败仍由 effect 队列退避重试（成功即清掉错误）；被 Multica 明确拒收的投递要等下一条 Input、新 Assignment 或 Ticket 结束才再投。
 4. **同一 Ticket 的两次投递并发**（11:56:48 两条相同评论）：Engine 与对账各排了一次投递。修法：每个 Ticket 的投递串行执行。
 
 **观察**：
@@ -306,4 +306,7 @@ daemon_id 是机器级的，存在 `~/.multica/daemon.id`，CLI daemon 与桌面
   只在已有排队 run 时才等待合并。
 - 远端 Worker 对重复投递很「诚实」（回报里写「第 N 次重复投递」），但每轮仍是完整的 run，费用照算：投递必须一次准确。
 
-**还没验证**：飞书私聊入口；Ticket 随 PR 合并结束（PR #7 待人工合并）。
+- 放宽 `refusedOutcome` 的代价：评论确实没触发任何 run（如 issue 被取消指派）时会被记为已投递，只剩 `deliveries[].read` 一直为 false；
+  steer 投递若没有 outcome 也会被当作成功（本次 runtime 不能 steer，未实测）。
+
+**还没验证**：飞书私聊入口；Ticket 随 PR 合并结束（PR #7 待人工合并）；重启中的 run 正常结束（那个 run 因 jxccs 上 opencode 免费额度用完而 failed）。
