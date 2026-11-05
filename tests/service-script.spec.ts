@@ -229,7 +229,8 @@ it('starts the service with the environment of the shell that ran start, not the
   expect(log).not.toContain('s3cret')
   const command = log.split('---\n').map(call => call.split('\n')).find(call => call[0] === 'new-window')!.find(word => word.startsWith('umask 077; '))!
   // The window runs it as the tmux server would: without the variable.
-  const { SUPERAGENT_TEST_SECRET: _gone, ...server } = { ...process.env, PATH: `${join(root, 'bin')}:${process.env.PATH}` }
+  const server: NodeJS.ProcessEnv = { ...process.env, PATH: `${join(root, 'bin')}:${process.env.PATH}` }
+  delete server.SUPERAGENT_TEST_SECRET
   await new Promise<void>(resolve => execFile('sh', ['-c', command], { env: server, cwd: root }, () => resolve()))
   expect(readFileSync(join(root, 'dsh-env'), 'utf8')).toContain('SUPERAGENT_TEST_SECRET=s3cret')
   // The snapshot is read once and gone.

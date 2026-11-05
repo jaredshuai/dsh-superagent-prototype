@@ -62,9 +62,10 @@ export class MulticaApi {
     return schema.parse(text ? JSON.parse(text) : null)
   }
   /** Creates an issue assigned to `agentId`, which starts its first run. */
+  /** Creates one ticket's issue; another active issue may carry the same title, which Multica refuses unless told it is meant. */
   createIssue(input: { title: string; description: string; agentId: string }, signal?: AbortSignal): Promise<Issue> {
     return this.request('POST', '/api/issues', IssueSchema,
-      { title: input.title, description: input.description, assignee_id: input.agentId, assignee_type: 'agent' }, signal)
+      { title: input.title, description: input.description, assignee_id: input.agentId, assignee_type: 'agent', allow_duplicate: true }, signal)
   }
   async setMetadata(issueId: string, key: string, value: string, signal?: AbortSignal): Promise<void> {
     await this.request('PUT', `/api/issues/${encodeURIComponent(issueId)}/metadata/${encodeURIComponent(key)}`, z.unknown(), { value }, signal)
