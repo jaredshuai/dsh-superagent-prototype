@@ -224,8 +224,12 @@ daemon_id 是机器级的，存在 `~/.multica/daemon.id`，CLI daemon 与桌面
 - 全部候选不健康：Ticket 的 Assignment 停在 pending（不建 issue），Executor 以 `progress` 回报挂一个待人工决定
   （「No Multica workstation is online to run this ticket…」），每个 Assignment 只问一次（记在 `multica-waiting:<ticket>`，重连、重启都不重复）。
   任一候选恢复健康后排队的 Ticket 自动派发，派发成功后若这个问题仍挂着就以 `question: null` 撤下。
-  待验证：runtime 掉线时服务端是否一定推送 `agent:status`（或别的 `runtime:` / `daemon:` 事件）。稳态下 90 s 内没有任何此类事件（2026-11-05 探针），
-  只在状态变化时才有；如果某种掉线完全不推送，健康要等到下次重连才更新。
+  **实测（2026-11-05，jxccs，`kill -STOP` 冻结 CLI 与桌面端两个 daemon 4 分钟模拟整机断网，不触发 Deregister）**：
+  - 掉线：最后一次心跳后约 2 分 37 秒，服务端推 `daemon:register`，payload 只有 `{"action":"stale_sweep"}`（`actor_type: system`，不带 runtime / agent id），
+    同类事件推了两次，分两批把本机 6 个 runtime 置为 `offline`。
+  - 恢复：解冻后 1 s 内推 6 条 `daemon:register` `{"action":"heartbeat_recovery"}`，runtime 回到 `online`。
+  - 全程 agent 的 `status` 一直是 `idle`，不会变成 `offline`：健康必须看 runtime 状态，不能只看 agent。
+  - 稳态下（90 s 探针）没有任何此类事件。所以「收到 `daemon:` 事件就重取快照」正好覆盖掉线与恢复，事件不带 id 也无妨。
   同理，取快照的 REST 请求失败时不重试（不轮询），记在 `worker` 健康项里，等下一个此类事件或重连再取。
 - 重启：远端 run 不受影响，所以 `resume` 不打断 running 的 Assignment，只重新排队 pending 的启动；连接建立后的补齐会追上错过的事件。
 

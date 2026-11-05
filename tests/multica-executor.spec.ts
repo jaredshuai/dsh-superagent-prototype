@@ -439,6 +439,22 @@ describe('MulticaExecutor', () => {
       expect(h.api.agents).toHaveBeenCalledTimes(2)
     })
 
+    it('follows a workstation going offline and back by its daemon:register sweeps, while its agents stay idle', async () => {
+      // As measured on 2026-11-05: a stale sweep marks the runtimes offline, a heartbeat recovers them, and neither names them.
+      const h = candidates()
+      await h.connect()
+      h.runtimes.find(runtime => runtime.id === 'rt-up')!.status = 'offline'
+      await h.push({ type: 'daemon:register', actor_type: 'system', payload: { action: 'stale_sweep' } })
+      keepQuestions(h)
+      await h.launch()
+      expect(h.api.createIssue).not.toHaveBeenCalled()
+      expect(h.engine.report).toHaveBeenCalledWith('t1', expect.objectContaining({ question: expect.stringContaining('No Multica workstation') }))
+      h.runtimes.find(runtime => runtime.id === 'rt-up')!.status = 'online'
+      await h.push({ type: 'daemon:register', actor_type: 'system', payload: { action: 'heartbeat_recovery' } })
+      await h.runLaunches()
+      expect(assignedTo(h)).toEqual(['a-ok'])
+    })
+
     it('catches up on health when the event stream reconnects', async () => {
       const h = allOffline()
       await h.connect()
