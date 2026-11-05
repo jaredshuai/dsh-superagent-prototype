@@ -236,13 +236,8 @@ daemon_id 是机器级的，存在 `~/.multica/daemon.id`，CLI daemon 与桌面
   触发 assignee（第 7.1 节第 1 项实测：3 s 内进入 running）——这正是要避免的多余 run。
 - 代价：`/note` 不进 run，Worker 只能主动去看。所以描述里要求 Worker 发完回报后列一次评论；对账由 WebSocket `comment:created`
   推送触发，反馈通常在 1–2 s 内出现。即使这一轮没看到，下一轮 run 开始时读最新评论也会看到。
-- **线上实测：待做**（本次实现时自动化环境不允许往 Multica 写评论）。在任一已结束、无活跃 run 的测试 issue（如 JAR-49）上执行：
-
-  ```sh
-  printf '/note superagent: probe — ignore.\n' | multica issue comment add JAR-49 --parent <某条 agent 评论 id> --content-stdin --output json
-  # 期望：返回的 trigger_outcomes 为空；20 s 后 multica issue runs JAR-49 的 run 数不变
-  ```
-
-  结果填回这里。若线上服务与源码不一致（`/note` 也触发了 run），退路是让 Worker 识别 `/note superagent:` 开头的触发评论后直接结束本轮（不回报），
-  并在协议说明里写明。
+- **线上实测（2026-11-05，jxccs，multica CLI 0.8.0，api.multica.ai）：确认不触发。** JAR-49 指派给 `failover-test-jxccs`，两个 run 都已 completed、
+  没有活跃 run（正是第 7.1 节第 1 项里普通评论 3 s 内就起新 run 的状态）。08:52:35Z 以成员身份在 agent 评论 `01a1a9a4…` 下回复
+  `/note superagent: probe for issue #3 …`（评论 `01a1aae8-f246-7f3d-bc3f-22580c916e4a`，`parent_id` 正确）；08:52:59Z 再查 `multica issue runs JAR-49`，
+  仍是原来的 2 个 completed run，没有新 run。线上行为与源码一致，不需要退路（让 Worker 识别并忽略 `/note superagent:` 触发的 run）。
 
