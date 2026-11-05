@@ -198,12 +198,12 @@ daemon_id 是机器级的，存在 `~/.multica/daemon.id`，CLI daemon 与桌面
 
 **与第 2 节的差异**：回报防伪第一版不用 HMAC（要求 LLM 在 shell 里算 HMAC 不可靠），改为三重校验：
 评论作者必须是配置的 agent（`author_type = agent`、`author_id` 匹配，由 Multica 服务端保证）、块内 `assignment` 必须是当前 Assignment、
-`nonce` 必须等于该 Assignment 在 issue 描述（或改派评论）里下发的随机值。旧 Assignment 的回报因 nonce 不同一律拒收。
+`nonce` 必须等于该 Assignment 在 issue 描述（或后续 Assignment 评论）里下发的随机值。旧 Assignment 的回报因 nonce 不同一律拒收。
 
 **行为要点**：
 
 - `start`：首个 Assignment 建 issue（描述 = 协议 + Assignment JSON，触发消息全文内联，因为远端读不了 Ticket 资源），metadata 写 `superagent_ticket`；
-  之后的 Assignment（重试等）在同一 issue 发改派评论，带新 nonce，并把当时已有的 run 记为基线。
+  之后的 Assignment（重试等）在同一 issue 发一条后续 Assignment 评论，带新 nonce，并把当时已有的 run 记为基线。
 - `deliver`：按第 7.1 节规则；成功发出评论即 `inputsDelivered`，带它的 run 开始运行时 `inputsRead`（steer 成功时立即 `inputsRead`）；
   Multica 返回 `blocked` / `deferred` 等不重试，记 `deliveryFailed`。
 - 对账（每个 Ticket 串行）：由 WebSocket 事件触发，每次（重）连接对所有有 issue 的未结束 Ticket 补一次。先处理新的 agent 评论里的回报块，

@@ -20,7 +20,7 @@ import { batchLine, batchOf, inputMessage, sourceTrigger, ticketExecution, trigg
 import type { Comment, MulticaApi, Run } from './multica-api.ts'
 import { MulticaEvents, type MulticaEvent, type SocketFactory } from './multica-events.ts'
 import type { MulticaConnection } from './multica-api.ts'
-import { ENDED_STATUSES, WAITING_STATUSES, inputComment, issueDescription, newNonce, parseReports, planDelivery, reassignmentComment,
+import { ENDED_STATUSES, WAITING_STATUSES, inputComment, issueDescription, newNonce, parseReports, planDelivery, laterAssignmentComment,
   refusedOutcome, type Brief, type ReportBlock } from './multica-protocol.ts'
 
 /** Which agent runs the tickets, and what every worker is told about where to work. */
@@ -216,7 +216,7 @@ export class MulticaExecutor implements Executor {
         const before = await this.host.api.runs(state.issueId)
         this.save(ticketId, { ...state, assignment: { id: assignmentId, nonce }, runs: Object.fromEntries(before.map(run => [run.id, run.status])),
           cancelled: [...state.cancelled ?? [], ...before.filter(run => !ENDED_STATUSES.has(run.status)).map(run => run.id)].slice(-50) })
-        const posted = await this.host.api.addComment(state.issueId, reassignmentComment(brief))
+        const posted = await this.host.api.addComment(state.issueId, laterAssignmentComment(brief))
         const refused = refusedOutcome(posted.trigger_outcomes ?? undefined, this.host.config.agentId)
         if (refused) throw new Error(`Multica did not start the agent: ${refused}`)
       }

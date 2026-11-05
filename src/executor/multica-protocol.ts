@@ -104,7 +104,7 @@ export function issueDescription(brief: Brief): string {
 }
 
 /** The comment that starts a later Assignment on an issue that already exists, such as after a retry. */
-export function reassignmentComment(brief: Brief, note?: string): string {
+export function laterAssignmentComment(brief: Brief, note?: string): string {
   return [`A new assignment \`${brief.assignmentId}\` replaces the earlier one on this ticket${note ? `: ${note}` : '.'} `
     + `Report with \`"assignment": "${brief.assignmentId}"\` and \`"nonce": "${brief.nonce}"\` from now on; reports for earlier assignments are ignored. `
     + 'The protocol in the issue description still applies.', '', '```json', brief.assignment, '```'].join('\n')
