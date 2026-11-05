@@ -19,7 +19,7 @@ import { z } from 'zod'
 export { commentTrigger, type GithubComment } from './github-trigger.ts'
 /** A notification of the agent account; `subject.url` is the API address of its Issue or PR. */
 const NotificationSchema = z.looseObject({
-  repository: z.looseObject({ full_name: z.string() }), subject: z.looseObject({ url: z.string().nullish() }),
+  id: z.string(), updated_at: z.string(), repository: z.looseObject({ full_name: z.string() }), subject: z.looseObject({ url: z.string().nullish() }),
 })
 
 const GithubConfigSchema = GithubAccountsSchema.extend({ pollSeconds: z.number().int().min(60).max(3600).default(60),
@@ -154,6 +154,8 @@ const newRound = (signal?: AbortSignal): Round => ({ started: new Date().toISOSt
 const stopped = (ctx: SourceContext, round: Round): boolean => !!round.signal?.aborted || !ctx.config(SOURCE)
 export interface Retry { since: string; pr: boolean; failedAt?: string; attempts?: number }
 const RETRY_WINDOW_MS = 24 * 3600_000
+/** How far before the cursor the notification list reaches: GitHub lists a notification later than the `updated_at` it carries. */
+const NOTIFICATION_LAG_MS = 10 * 60_000
 /** True when GitHub returns HTTP 410 (Gone); HTTP 404 is retried because it can indicate revoked access to a private repository. */
 const deleted = (error: unknown): boolean => error instanceof CliError && error.code === 410
 /** Records a failed read on the Thread and in the round; deleted (410) or abandoned (24h+) threads do not fail the round. */
@@ -301,7 +303,11 @@ async function pollNotifications(ctx: SourceContext, round: Round): Promise<{ co
   const since = state.get(KV.github.since) ?? round.started
   if (state.get(KV.github.since) === undefined) state.set(KV.github.since, since)
   const { repository } = ctx.deployment
-  const path = `notifications?all=true&per_page=50&since=${encodeURIComponent(since)}`
+  // GitHub lists a notification some time after the `updated_at` it carries, so the list reaches back further than the cursor;
+  // `notified` keeps what was taken within that reach, so a notification listed again unchanged is not read again.
+  const reach = new Date(Date.parse(since) - NOTIFICATION_LAG_MS).toISOString()
+  const taken = Object.fromEntries(Object.entries(state.get(KV.github.notified) ?? {}).filter(([, at]) => at >= reach))
+  const path = `notifications?all=true&per_page=50&since=${encodeURIComponent(reach)}`
   const raw = await commands.api(path, '--include')
   const split = raw.search(/\r?\n\r?\n/)
   if (split < 0) throw new Error('GitHub returned no HTTP headers')
@@ -317,10 +323,14 @@ async function pollNotifications(ctx: SourceContext, round: Round): Promise<{ co
   const items = new Map(Object.entries(retries).map(([number, retry]) => [Number(number), retry]))
   for (const notification of notifications.reverse()) {
     if (!sameName(notification.repository.full_name, repository)) continue
+    if (taken[notification.id] === notification.updated_at) continue
+    taken[notification.id] = notification.updated_at
     const address = githubAddress(notification.subject.url ?? '', repository)
     if (!address || address.discussion || items.has(address.number)) continue
     const { number, pr } = address
-    items.set(number, { since: [state.get(KV.github.cursor(number)) ?? since, since].sort().at(-1)!, pr })
+    // A late notification is read from where it reaches, not from the cursor that already passed it.
+    const from = notification.updated_at < since ? reach : since
+    items.set(number, { since: [state.get(KV.github.cursor(number)) ?? from, from].sort().at(-1)!, pr })
   }
   for (const [number, item] of items) {
     if (stopped(ctx, round)) return { count: notifications.length, interval }
@@ -338,7 +348,9 @@ async function pollNotifications(ctx: SourceContext, round: Round): Promise<{ co
       delete retries[number]
     }
   }
-  ctx.atomic(() => { state.set(KV.github.since, cursorAt(round.started)); state.set(KV.github.retries, retries) })
+  ctx.atomic(() => {
+    state.set(KV.github.since, cursorAt(round.started)); state.set(KV.github.notified, taken); state.set(KV.github.retries, retries)
+  })
   return { count: notifications.length, interval }
 }
 async function readNotified(ctx: SourceContext, round: Round, number: number, item: Retry): Promise<void> {

@@ -572,6 +572,28 @@ describe('github source', () => {
     expect(h.store.tickets.get('t9')).toMatchObject({ ended: { outcome: 'merged' } })
     h.store.close()
   })
+  it('takes a notification GitHub lists only after its cursor passed it, and reads it once', async () => {
+    // Live, 2026-11-05: a mention notification stamped 11:38:48 was listed later than the next round's cursor (start − 5 s).
+    const h = host()
+    const ago = (seconds: number) => new Date(Date.now() - seconds * 1000).toISOString()
+    h.store.set('github-since', ago(120))
+    const routes: Record<string, unknown> = { notifications: [] }
+    const reads = github(h, routes)
+    await pollRound(h)
+    const cursor = h.store.get<string>('github-since')!
+    // Stamped before the cursor the previous round left, as GitHub stamps a notification it lists late.
+    const stamped = new Date(Date.parse(cursor) - 30_000).toISOString()
+    Object.assign(routes, { notifications: [{ ...notification(20), updated_at: stamped }],
+      'issues/20': issue(20, { created_at: stamped, body: '@agent-bot add a file' }) })
+    await pollRound(h)
+    expect(h.receive.mock.calls.map(([trigger]) => trigger.meta.number)).toEqual([20])
+    const listed = reads.filter(path => path.startsWith('notifications?'))
+    expect(Date.parse(new URL(`https://x/${listed.at(-1)!}`).searchParams.get('since')!)).toBeLessThan(Date.parse(stamped))
+    // Listed again, unchanged, within the look-back: no second read.
+    await pollRound(h)
+    expect(bare(reads).filter(path => path === 'issues/20')).toHaveLength(1)
+    h.store.close()
+  })
   it('reads each notified Issue alone and reads a failed one again next round, from where it was', async () => {
     const h = host()
     h.store.set('github-since', '2026-09-08T00:00:00.000Z')
@@ -866,8 +888,11 @@ describe('github source', () => {
   it('keeps one body Trigger for an Issue that a later poll reads again', async () => {
     const h = host()
     // Opened just before the poll, the Issue is still after the cursor the next poll reads from.
-    notify(h, [issue(12, { created_at: new Date(Date.now() - 1000).toISOString() })], {}, new Date(Date.now() - 60_000).toISOString())
+    const created_at = new Date(Date.now() - 1000).toISOString()
+    notify(h, [issue(12, { created_at })], {}, new Date(Date.now() - 60_000).toISOString())
     await pollRound(h)
+    // The notification changes, so the next poll reads the Issue, and its body, again.
+    notify(h, [issue(12, { created_at, updated_at: new Date().toISOString() })], {}, h.store.get<string>('github-since'))
     await pollRound(h)
     expect(h.receive).toHaveBeenCalledTimes(2)
     expect(h.store.read.threadTriggers('github:12', 10).map(trigger => trigger.id)).toEqual([key('github-issue', '12')])
