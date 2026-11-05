@@ -16,8 +16,28 @@ function ticketWith(assignments: Partial<Assignment>[], extra: Partial<Ticket> =
     inputs: [], undelivered: [], channels: [], ...extra } as unknown as Ticket
 }
 
-function setup(initial: Ticket) {
+/** A WebSocket the test drives: it opens, acknowledges the auth frame, and pushes events. */
+class FakeSocket {
+  readyState = 1
+  sent: string[] = []
+  onopen: ((event: unknown) => void) | null = null
+  onmessage: ((event: { data: unknown }) => void) | null = null
+  onclose: ((event: { code?: number; reason?: string }) => void) | null = null
+  onerror: ((event: unknown) => void) | null = null
+  send(data: string) { this.sent.push(data) }
+  close() { this.readyState = 3; this.onclose?.({ code: 1000 }) }
+  push(message: object) { this.onmessage?.({ data: JSON.stringify(message) }) }
+}
+type AgentRow = { id: string; status: string; runtime_id?: string | null; archived_at?: string | null }
+type RuntimeRow = { id: string; status: string }
+/** Lets queued promise chains, such as a health refresh and the launches it releases, run to the end. */
+const settle = async () => { for (let i = 0; i < 20; i++) await new Promise(resolve => setTimeout(resolve, 0)) }
+
+function setup(initial: Ticket, options: { agents?: string[]; pickHealthy?: boolean } = {}) {
   let ticket = initial
+  const sockets: FakeSocket[] = []
+  const agents: AgentRow[] = []
+  const runtimes: RuntimeRow[] = []
   const kv = new Map<string, unknown>()
   const handlers: Record<string, (payload: never) => Promise<void>> = {}
   const enqueued: { kind: string; key: string }[] = []
@@ -47,28 +67,51 @@ function setup(initial: Ticket) {
       return { ...comment, trigger_outcomes: content.startsWith('/note') ? [] : [{ status: outcome, target_id: AGENT }] }
     }),
     cancelRun: vi.fn(async () => {}),
+    agents: vi.fn(async () => agents.map(agent => ({ ...agent }))),
+    runtimes: vi.fn(async () => runtimes.map(runtime => ({ ...runtime }))),
   }
   const host = {
     engine, health, api,
     store: {
       tickets: { get: () => ticket, open: () => ticket.ended ? [] : [ticket] },
       triggers: { get: (id: string) => id === 'tr1' ? trigger : undefined },
-      get: (key: string) => kv.get(key), set: (key: string, value: unknown) => { kv.set(key, value) },
+      get: (key: string) => kv.get(key), set: (key: string, value: unknown) => { kv.set(key, value) }, delete: (key: string) => { kv.delete(key) },
       settings: () => ({ policy: { rules: [] }, executor: { directory: '' } }), atomic: <T>(work: () => T) => work(),
     },
     effects: { enqueue: (kind: string, key: string) => { enqueued.push({ kind, key }) },
       handle: (kind: string, run: (payload: never) => Promise<void>) => { handlers[kind] = run } },
     sessions: { relay: vi.fn() },
     machine: { stateDir: '/state' }, lifetime: new AbortController().signal,
-    config: { serverUrl: 'https://multica.test', workspaceId: 'w', token: 'mul_x', agentId: AGENT, repository: 'https://github.com/o/r' },
-    socketFactory: () => { throw new Error('no sockets in tests') },
+    config: { serverUrl: 'https://multica.test', workspaceId: 'w', token: 'mul_x', agents: options.agents ?? [AGENT],
+      pickHealthy: options.pickHealthy ?? false, repository: 'https://github.com/o/r' },
+    socketFactory: () => { const socket = new FakeSocket(); sockets.push(socket); return socket },
     closing: () => false, paused: () => false,
     sourceLink: async () => ({ source_url: 'https://github.com/o/r/issues/2' }), repliedTo: () => undefined, sendReplies: vi.fn(async () => {}),
     claimPull: vi.fn(async (): Promise<string | undefined> => undefined),
   } as unknown as MulticaExecutorHost
   let executor = new MulticaExecutor(host)
   return {
-    get executor() { return executor }, engine, api, runs, comments, posted, enqueued, health, host,
+    get executor() { return executor }, engine, api, runs, comments, posted, enqueued, health, host, agents, runtimes,
+    /** Connects the event stream, or completes the reconnection `drop` started, and lets the catch-up finish. */
+    connect: async () => {
+      if (!sockets.length) executor.install()
+      const socket = sockets.at(-1)!
+      socket.onopen?.({})
+      socket.push({ type: 'auth_ack' })
+      await settle()
+    },
+    /** Drops the event stream and waits out the backoff until it opens a new socket. */
+    drop: async () => {
+      const count = sockets.length
+      sockets.at(-1)!.onclose?.({ code: 1006 })
+      await vi.waitFor(() => { expect(sockets.length).toBe(count + 1) }, { timeout: 3000 })
+    },
+    push: async (event: object) => { sockets.at(-1)!.push(event); await settle() },
+    /** Runs the launches queued so far, as the effect queue would. */
+    runLaunches: async () => {
+      const queued = enqueued.splice(0).filter(item => item.kind === 'launch')
+      for (const item of queued) await handlers.launch!({ ticketId: 't1', assignmentId: item.key } as never)
+    },
     /** A new executor over the same store and Multica, as after a restart. */
     restart: () => { executor = new MulticaExecutor(host) },
     setState: (next: MulticaTicketState) => { kv.set(MULTICA_KV.ticket('t1'), next) },
@@ -277,6 +320,114 @@ describe('MulticaExecutor', () => {
         { ...agentComment('k2', '```' + REPORT_FENCE + '\n{oops\n```'), author_type: 'member', author_id: 'someone' })
       await h.executor.reconcile('t1')
       expect(notes(h)).toEqual([])
+    })
+  })
+
+  describe('candidate agents', () => {
+    const CANDIDATES = ['a-off-runtime', 'a-off', 'a-ok', 'a-ok-2']
+    function candidates() {
+      const h = setup(ticketWith([{ state: 'pending' }]), { agents: CANDIDATES, pickHealthy: true })
+      h.runtimes.push({ id: 'rt-down', status: 'offline' }, { id: 'rt-up', status: 'online' })
+      h.agents.push({ id: 'a-off-runtime', status: 'idle', runtime_id: 'rt-down' }, { id: 'a-off', status: 'offline', runtime_id: 'rt-up' },
+        { id: 'a-ok', status: 'working', runtime_id: 'rt-up' }, { id: 'a-ok-2', status: 'idle', runtime_id: 'rt-up' })
+      return h
+    }
+    const assignedTo = (h: ReturnType<typeof setup>) =>
+      (h.api.createIssue.mock.calls as unknown as [{ agentId: string }][]).map(([input]) => input.agentId)
+
+    it('assigns a new ticket to the first healthy candidate, skipping unhealthy ones', async () => {
+      const h = candidates()
+      await h.connect()
+      await h.launch()
+      expect(assignedTo(h)).toEqual(['a-ok'])
+      expect(h.engine.assignmentStarted).toHaveBeenCalledWith('t1', 'a1')
+      expect(h.state()).toMatchObject({ agentId: 'a-ok' })
+      // Its reports are the ones accepted, not the first candidate's.
+      h.setTicket(ticketWith([{}]))
+      const nonce = h.state()!.assignment!.nonce
+      h.comments.push({ ...agentComment('k1', report({ tool: 'report', state: 'progress', summary: 'first' }, nonce)), author_id: 'a-off-runtime' },
+        { ...agentComment('k2', report({ tool: 'report', state: 'progress', summary: 'chosen' }, nonce)), author_id: 'a-ok' })
+      await h.executor.reconcile('t1')
+      expect(h.engine.report).toHaveBeenCalledTimes(1)
+      expect(h.engine.report).toHaveBeenCalledWith('t1', { state: 'progress', summary: 'chosen' })
+    })
+
+    it('assigns every ticket to the single MULTICA_AGENT_ID agent without reading health, as before', async () => {
+      const h = setup(ticketWith([{ state: 'pending' }]))
+      await h.connect()
+      await h.push({ type: 'agent:status', payload: {} })
+      await h.launch()
+      expect(assignedTo(h)).toEqual([AGENT])
+      expect(h.api.agents).not.toHaveBeenCalled()
+      expect(h.api.runtimes).not.toHaveBeenCalled()
+    })
+
+    /** Lets the recording Engine keep a reported question on the ticket, as the real one does. */
+    function keepQuestions(h: ReturnType<typeof setup>) {
+      h.engine.report.mockImplementation(((_id: string, report: { question?: string | null }) => {
+        const { attention: _attention, ...rest } = h.host.store.tickets.get('t1')!
+        const next = report.question ? { ...rest, attention: { id: 'q1', question: report.question } }
+          : report.question === null ? rest : h.host.store.tickets.get('t1')!
+        h.setTicket(next as Ticket)
+        return next
+      }) as never)
+    }
+    function allOffline() {
+      const h = candidates()
+      for (const agent of h.agents) agent.status = 'offline'
+      keepQuestions(h)
+      return h
+    }
+
+    it('keeps a ticket queued while no candidate is healthy, and asks a person once', async () => {
+      const h = allOffline()
+      await h.connect()
+      await h.launch()
+      expect(h.api.createIssue).not.toHaveBeenCalled()
+      expect(h.engine.assignmentStarted).not.toHaveBeenCalled()
+      expect(h.engine.report).toHaveBeenCalledTimes(1)
+      expect(h.engine.report).toHaveBeenCalledWith('t1', expect.objectContaining({ state: 'progress',
+        question: expect.stringContaining('No Multica workstation is online') }))
+      expect(h.host.sessions.relay).toHaveBeenCalledTimes(1)
+      // Launching again, after a reconnect or a restart, asks nothing more.
+      await h.drop()
+      await h.connect()
+      await h.launch()
+      h.restart()
+      await h.launch()
+      expect(h.api.createIssue).not.toHaveBeenCalled()
+      expect(h.engine.report).toHaveBeenCalledTimes(1)
+      expect(h.host.sessions.relay).toHaveBeenCalledTimes(1)
+    })
+
+    it('dispatches a queued ticket once a candidate comes online, and withdraws the question', async () => {
+      const h = allOffline()
+      await h.connect()
+      await h.launch()
+      expect(h.engine.report).toHaveBeenCalledTimes(1)
+      // An event about something else reads no health.
+      await h.push({ type: 'activity:created', payload: {} })
+      expect(h.enqueued.filter(item => item.kind === 'launch')).toEqual([])
+      h.agents.find(agent => agent.id === 'a-ok-2')!.status = 'idle'
+      await h.push({ type: 'agent:status', payload: { agent: { id: 'a-ok-2', status: 'idle' } } })
+      await h.runLaunches()
+      expect(assignedTo(h)).toEqual(['a-ok-2'])
+      expect(h.engine.assignmentStarted).toHaveBeenCalledWith('t1', 'a1')
+      expect(h.engine.report).toHaveBeenLastCalledWith('t1', expect.objectContaining({ question: null }))
+      expect(h.host.store.tickets.get('t1')!.attention).toBeUndefined()
+      // Health was read on connecting and on the agent event, and on nothing else.
+      expect(h.api.agents).toHaveBeenCalledTimes(2)
+    })
+
+    it('catches up on health when the event stream reconnects', async () => {
+      const h = allOffline()
+      await h.connect()
+      await h.launch()
+      await h.drop()
+      h.agents.find(agent => agent.id === 'a-ok')!.status = 'idle'
+      await h.connect()
+      await h.runLaunches()
+      expect(assignedTo(h)).toEqual(['a-ok'])
     })
   })
 })

@@ -34,6 +34,12 @@ const PostedCommentSchema = CommentSchema.extend({
     .passthrough()).nullish() })
 export type PostedComment = z.infer<typeof PostedCommentSchema>
 
+const AgentSchema = z.object({ id: z.string(), status: z.string(), runtime_id: z.string().nullish(), archived_at: z.string().nullish(),
+  name: z.string().nullish() }).passthrough()
+export type Agent = z.infer<typeof AgentSchema>
+const RuntimeSchema = z.object({ id: z.string(), status: z.string(), name: z.string().nullish(), last_seen_at: z.string().nullish() }).passthrough()
+export type Runtime = z.infer<typeof RuntimeSchema>
+
 /** A failed Multica request, with its HTTP status (0 when the request did not get a response). */
 export class MulticaError extends Error {
   constructor(message: string, readonly status: number) { super(message) }
@@ -87,4 +93,8 @@ export class MulticaApi {
   async cancelRun(runId: string, signal?: AbortSignal): Promise<void> {
     await this.request('POST', `/api/tasks/${encodeURIComponent(runId)}/cancel`, z.unknown(), {}, signal)
   }
+  /** The workspace's agents, with their status and the runtime each is bound to. */
+  agents(signal?: AbortSignal): Promise<Agent[]> { return this.request('GET', '/api/agents', z.array(AgentSchema), undefined, signal) }
+  /** The workspace's runtimes (one per machine and CLI), with whether each is online. */
+  runtimes(signal?: AbortSignal): Promise<Runtime[]> { return this.request('GET', '/api/runtimes', z.array(RuntimeSchema), undefined, signal) }
 }

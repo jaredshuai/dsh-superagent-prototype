@@ -191,7 +191,8 @@ daemon_id 是机器级的，存在 `~/.multica/daemon.id`，CLI daemon 与桌面
 | `SUPERAGENT_EXECUTOR=multica` | 是 | 选择 MulticaExecutor |
 | `MULTICA_TOKEN` | 是 | `mul_` 个人 token，只放环境变量（如 `~/.config/superagent.env`），不进设置 |
 | `MULTICA_WORKSPACE_ID` | 是 | |
-| `MULTICA_AGENT_ID` | 是 | 第一版固定一个 agent（= 一台机器上的一个 runtime） |
+| `MULTICA_AGENT_IDS` | 二选一 | 有序的候选 Multica agent 列表，逗号分隔；新 Ticket 派给第一个健康的候选（见下「多候选」）。与 `MULTICA_AGENT_ID` 同时设置时以它为准 |
+| `MULTICA_AGENT_ID` | 二选一 | 旧写法：只有一个 agent（= 一台机器上的一个 runtime），不看健康状态、每张 Ticket 都派给它，行为与 v1 相同 |
 | `MULTICA_SERVER_URL` | 否 | 默认 `https://api.multica.ai` |
 | `SUPERAGENT_MULTICA_REPOSITORY` | 否 | Worker 克隆的仓库，如 `https://github.com/jaredshuai/superagent-sandbox` |
 | `SUPERAGENT_MULTICA_INSTRUCTIONS` | 否 | 追加给每个 Worker 的说明，如「用 `gh-agent` 提交和开 PR」 |
@@ -215,12 +216,22 @@ daemon_id 是机器级的，存在 `~/.multica/daemon.id`，CLI daemon 与桌面
   待发的反馈存在 `refusals` 里，发成功才移除，发失败下次对账再发；发之前先看 issue 上是否已有同一条评论下、同一块编号的反馈，
   有就不再发——所以重连补齐、执行器在「已发出但未存盘」时重启，都不会重复回复。别人（不是配置的 agent）的评论从不解析，也就不回复。
   issue 描述里告诉 Worker：发完回报后列一下评论，看到点名自己那块的 `/note superagent:` 回复就改正后重发。
+- 多候选（`MULTICA_AGENT_IDS`）：候选健康 = agent 存在、未归档、`status` 不是 `offline`，且它绑定的 runtime `status = online`。
+  健康快照来自 REST `GET /api/agents` 与 `GET /api/runtimes`，只在事件流每次（重）连接时、以及收到 `agent:` / `runtime:` / `daemon:`
+  事件（`daemon:heartbeat*` 除外）时取一次（同一时刻多个请求合并成一次），不做周期轮询（ADR 0002）。快照到手之前不派新 Ticket。
+  只有**新 Ticket**（还没有 issue 的）按健康挑选；已有 issue 的后续 Assignment 仍发到该 issue 已指派的 agent（换 agent 属于改派，见「还没做」）。
+  issue 指派给哪个 agent 记在 Ticket 状态的 `agentId` 里，回报作者校验与 `trigger_outcomes` 检查都以它为准。
+- 全部候选不健康：Ticket 的 Assignment 停在 pending（不建 issue），Executor 以 `progress` 回报挂一个待人工决定
+  （「No Multica workstation is online to run this ticket…」），每个 Assignment 只问一次（记在 `multica-waiting:<ticket>`，重连、重启都不重复）。
+  任一候选恢复健康后排队的 Ticket 自动派发，派发成功后若这个问题仍挂着就以 `question: null` 撤下。
+  待验证：runtime 掉线时服务端是否一定推送 `agent:status`（或别的 `runtime:` / `daemon:` 事件）。稳态下 90 s 内没有任何此类事件（2026-11-05 探针），
+  只在状态变化时才有；如果某种掉线完全不推送，健康要等到下次重连才更新。
 - 重启：远端 run 不受影响，所以 `resume` 不打断 running 的 Assignment，只重新排队 pending 的启动；连接建立后的补齐会追上错过的事件。
 
 **还没做**：
 
 1. ~~回报被拒只记在 `worker` 健康项里~~：已做，见上「回报被拒的反馈」与第 8.1 节。
-2. 多候选 agent 与跨机故障转移（第 4 节）；当前只有一个固定 agent。
+2. ~~多候选 agent~~：已做，见上「多候选」。跨机故障转移与改派（第 4 节第 2、2b 层）还没做。
 3. 线上端到端联调：在服务器上设置上述环境变量，用测试 agent 跑一张真实 Ticket。
 4. 第 7 节第 5、6 项（各 runtime 对协议的遵从度、MCP 注入）。
 

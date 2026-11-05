@@ -18,15 +18,21 @@ import type { HealthEntry } from '../infra/health.ts'
 import { family } from '../kv.ts'
 import { batchLine, batchOf, inputMessage, sourceTrigger, ticketExecution, triggerMessage } from './dsh.ts'
 import type { Comment, MulticaApi, Run } from './multica-api.ts'
+import { MulticaCandidates } from './multica-candidates.ts'
 import { MulticaEvents, type MulticaEvent, type SocketFactory } from './multica-events.ts'
 import type { MulticaConnection } from './multica-api.ts'
 import { ENDED_STATUSES, WAITING_STATUSES, inputComment, isRefusalNote, issueDescription, newNonce, parseReports, planDelivery,
   laterAssignmentComment, refusalNote, refusedOutcome, type Brief, type ReportBlock } from './multica-protocol.ts'
 
-/** Which agent runs the tickets, and what every worker is told about where to work. */
+/** Which agents run the tickets, and what every worker is told about where to work. */
 export interface MulticaExecutorConfig extends MulticaConnection {
-  /** The Multica agent issues are assigned to: one runtime on one machine. */
-  agentId: string
+  /** The Multica agents a new ticket's issue may be assigned to, in order of preference: each one runtime on one machine. */
+  agents: readonly string[]
+  /**
+   * Whether a new ticket goes to the first healthy agent and waits while none is (`MULTICA_AGENT_IDS`). Without it the
+   * first agent gets every ticket whatever its state, as with the single `MULTICA_AGENT_ID`, and Multica queues the run.
+   */
+  pickHealthy: boolean
   /** Git remote workers clone, such as `https://github.com/owner/repo`. */
   repository?: string
   /** Extra instructions for every worker, such as the git identity to commit and open PRs with. */
@@ -35,23 +41,30 @@ export interface MulticaExecutorConfig extends MulticaConnection {
 
 /**
  * The Multica executor's configuration from the environment, or undefined to keep the DSH executor: `SUPERAGENT_EXECUTOR=multica`
- * selects it, with `MULTICA_TOKEN`, `MULTICA_WORKSPACE_ID` and `MULTICA_AGENT_ID` required, and `MULTICA_SERVER_URL`,
- * `SUPERAGENT_MULTICA_REPOSITORY` and `SUPERAGENT_MULTICA_INSTRUCTIONS` optional. The token stays in the environment, never in settings.
+ * selects it, with `MULTICA_TOKEN`, `MULTICA_WORKSPACE_ID` and either `MULTICA_AGENT_IDS` (ordered, comma-separated candidates
+ * picked by health) or `MULTICA_AGENT_ID` (one agent, no health check) required; the list wins when both are set.
+ * `MULTICA_SERVER_URL`, `SUPERAGENT_MULTICA_REPOSITORY` and `SUPERAGENT_MULTICA_INSTRUCTIONS` are optional. The token stays
+ * in the environment, never in settings.
  * @throws Error naming the missing variables when the Multica executor is selected without them.
  */
 export function multicaConfigFromEnv(env: Record<string, string | undefined>): MulticaExecutorConfig | undefined {
   if (env.SUPERAGENT_EXECUTOR !== 'multica') return undefined
-  const missing = ['MULTICA_TOKEN', 'MULTICA_WORKSPACE_ID', 'MULTICA_AGENT_ID'].filter(name => !env[name]?.trim())
+  const candidates = (env.MULTICA_AGENT_IDS ?? '').split(',').map(id => id.trim()).filter(Boolean)
+  const single = env.MULTICA_AGENT_ID?.trim()
+  const missing = ['MULTICA_TOKEN', 'MULTICA_WORKSPACE_ID'].filter(name => !env[name]?.trim())
+  if (!candidates.length && !single) missing.push('MULTICA_AGENT_ID or MULTICA_AGENT_IDS')
   if (missing.length) throw new Error(`SUPERAGENT_EXECUTOR=multica needs ${missing.join(', ')}`)
   const repository = env.SUPERAGENT_MULTICA_REPOSITORY?.trim(), instructions = env.SUPERAGENT_MULTICA_INSTRUCTIONS?.trim()
   return { serverUrl: env.MULTICA_SERVER_URL?.trim() || 'https://api.multica.ai', token: env.MULTICA_TOKEN!.trim(),
-    workspaceId: env.MULTICA_WORKSPACE_ID!.trim(), agentId: env.MULTICA_AGENT_ID!.trim(),
+    workspaceId: env.MULTICA_WORKSPACE_ID!.trim(), agents: candidates.length ? candidates : [single!], pickHealthy: candidates.length > 0,
     ...repository ? { repository } : {}, ...instructions ? { instructions } : {} }
 }
 
 /** What MulticaExecutor keeps per ticket, under `multica-ticket:<ticket id>`. */
 export interface MulticaTicketState {
   issueId: string
+  /** The Multica agent the issue is assigned to; states saved before candidates existed lack it and mean the first configured agent. */
+  agentId?: string
   identifier?: string
   /** The Assignment the issue's worker reports for now, with the nonce its reports must carry. */
   assignment?: { id: string; nonce: string }
@@ -71,6 +84,8 @@ export interface Refusal { commentId: string; index: number; note: string }
 export const MULTICA_KV = {
   ticket: family<MulticaTicketState>('multica-ticket:'),
   issue: family<string>('multica-issue:'),
+  /** A ticket whose first Assignment waits for a healthy candidate, once a person has been asked to start a workstation. */
+  waiting: family<{ assignmentId: string }>('multica-waiting:'),
 }
 const SEEN_LIMIT = 500
 /** How many cancelled runs, deliveries and pending refusal notes a ticket's state keeps. */
@@ -79,7 +94,7 @@ const HISTORY_LIMIT = 50
 export interface MulticaExecutorHost {
   readonly engine: Pick<EngineForExecutor, 'assignmentStarted' | 'inputsDelivered' | 'inputsRead' | 'turnEnded' | 'deliveryFailed' | 'report'
     | 'reply' | 'handback' | 'followForContext' | 'markUnrelated'>
-  readonly store: Pick<Store, 'tickets' | 'triggers' | 'get' | 'set' | 'settings' | 'atomic'>
+  readonly store: Pick<Store, 'tickets' | 'triggers' | 'get' | 'set' | 'delete' | 'settings' | 'atomic'>
   readonly effects: Pick<Effects, 'enqueue' | 'handle'>
   readonly sessions: Pick<Sessions, 'relay'>
   /** The `worker` health entry: the event stream's state and the last failure. */
@@ -87,7 +102,7 @@ export interface MulticaExecutorHost {
   readonly machine: { stateDir: string }
   readonly lifetime: AbortSignal
   readonly config: MulticaExecutorConfig
-  readonly api: Pick<MulticaApi, 'createIssue' | 'setMetadata' | 'findIssues' | 'runs' | 'comments' | 'addComment' | 'cancelRun'>
+  readonly api: Pick<MulticaApi, 'createIssue' | 'setMetadata' | 'findIssues' | 'runs' | 'comments' | 'addComment' | 'cancelRun' | 'agents' | 'runtimes'>
   /** Builds the event stream's sockets; tests pass their own. */
   readonly socketFactory?: SocketFactory
   closing(): boolean
@@ -119,9 +134,15 @@ export class MulticaExecutor implements Executor {
   /** Per-ticket reconciliation chains, so two events for one ticket never reconcile at once. */
   private readonly chains = new Map<string, Promise<void>>()
   private readonly again = new Set<string>()
+  private readonly candidates: MulticaCandidates
+  private refreshing: Promise<void> | undefined
+  private refreshAgain = false
+  /** Tickets whose launch waits for a healthy candidate. */
+  private readonly waiting = new Set<string>()
   constructor(private readonly host: MulticaExecutorHost) {
+    this.candidates = new MulticaCandidates(host.config.agents)
     this.events = new MulticaEvents(host.config, {
-      connected: () => { this.healthy('Connected to Multica'); this.catchUp() },
+      connected: () => { this.healthy('Connected to Multica'); this.refreshCandidates(); this.catchUp() },
       event: event => { this.event(event) },
       disconnected: reason => { this.host.health.set({ state: 'error', detail: `Multica event stream: ${reason}; reconnecting`, at: now() }) },
     }, host.socketFactory)
@@ -164,6 +185,7 @@ export class MulticaExecutor implements Executor {
     this.host.store.set(MULTICA_KV.ticket(ticketId), state)
     this.host.store.set(MULTICA_KV.issue(state.issueId), ticketId)
   }
+  private agentOf(state: MulticaTicketState): string { return state.agentId ?? this.host.config.agents[0]! }
   private healthy(detail: string): void { this.host.health.set({ state: 'ready', detail, at: now() }) }
   private failure(what: string, error: unknown): void {
     this.host.health.set({ state: 'error', detail: `${what}: ${errorText(error)}`, at: now() })
@@ -213,18 +235,21 @@ export class MulticaExecutor implements Executor {
         if (found) state = { issueId: found.id, identifier: found.identifier ?? undefined, deliveries: [], seen: [], runs: {} }
       }
       if (!state) {
-        const issue = await this.host.api.createIssue({ title: first.ticket.title, description: issueDescription(brief), agentId: this.host.config.agentId })
+        const agentId = this.choose()
+        if (!agentId) { this.wait(ticketId, assignmentId); return }
+        const issue = await this.host.api.createIssue({ title: first.ticket.title, description: issueDescription(brief), agentId })
         // Save before anything else can fail, so the run the issue started reports into a known Assignment.
-        this.save(ticketId, { issueId: issue.id, identifier: issue.identifier ?? undefined, assignment: { id: assignmentId, nonce },
+        this.save(ticketId, { issueId: issue.id, identifier: issue.identifier ?? undefined, agentId, assignment: { id: assignmentId, nonce },
           deliveries: [], seen: [], runs: {} })
         await this.host.api.setMetadata(issue.id, 'superagent_ticket', ticketId)
+        this.dispatched(ticketId, agentId)
       } else {
         // Runs of earlier Assignments are the baseline: only runs that start from here on are this Assignment's turns.
         const before = await this.host.api.runs(state.issueId)
         this.save(ticketId, { ...state, assignment: { id: assignmentId, nonce }, runs: Object.fromEntries(before.map(run => [run.id, run.status])),
           cancelled: [...state.cancelled ?? [], ...before.filter(run => !ENDED_STATUSES.has(run.status)).map(run => run.id)].slice(-HISTORY_LIMIT) })
         const posted = await this.host.api.addComment(state.issueId, laterAssignmentComment(brief))
-        const refused = refusedOutcome(posted.trigger_outcomes ?? undefined, this.host.config.agentId)
+        const refused = refusedOutcome(posted.trigger_outcomes ?? undefined, this.agentOf(state))
         if (refused) throw new Error(`Multica did not start the agent: ${refused}`)
       }
       await this.host.api.setMetadata(this.state(ticketId)!.issueId, 'superagent_assignment', assignmentId).catch(() => { /* Informational only. */ })
@@ -236,6 +261,61 @@ export class MulticaExecutor implements Executor {
       this.failure('Launching on Multica', error)
       if (current()) this.reportFailed(ticketId, `Could not start the assignment on Multica: ${errorText(error)}`)
     }
+  }
+
+  /** The agent a new ticket's issue goes to: the first configured one, or with `pickHealthy` the first healthy candidate. */
+  private choose(): string | undefined {
+    return this.host.config.pickHealthy ? this.candidates.pick() : this.host.config.agents[0]
+  }
+  /**
+   * Keeps a new ticket queued while no candidate is healthy. Once health is known, a person is asked to start a
+   * workstation, once per Assignment: the question stays on the ticket across reconnections and restarts.
+   */
+  private wait(ticketId: string, assignmentId: string): void {
+    this.waiting.add(ticketId)
+    if (!this.candidates.known || this.host.store.get(MULTICA_KV.waiting(ticketId))?.assignmentId === assignmentId) return
+    this.record(ticketId, { state: 'progress', summary: 'Waiting for a Multica workstation to come online', question: this.noMachine() },
+      () => { this.host.store.set(MULTICA_KV.waiting(ticketId), { assignmentId }) })
+  }
+  private noMachine(): string {
+    return `No Multica workstation is online to run this ticket: none of the candidate agents (${this.host.config.agents.join(', ')}) `
+      + 'is online. Start one of their machines; the ticket is dispatched as soon as one is online.'
+  }
+  /** Takes a new snapshot of the candidates' health; refreshes asked for while one runs fold into one more. */
+  private refreshCandidates(): void {
+    if (!this.host.config.pickHealthy) return
+    if (this.refreshing) { this.refreshAgain = true; return }
+    const run = async (): Promise<void> => {
+      try {
+        const [agents, runtimes] = await Promise.all([this.host.api.agents(), this.host.api.runtimes()])
+        this.candidates.update(agents, runtimes)
+      } catch (error) { if (!this.host.closing()) this.failure('Reading Multica agent status', error) }
+      if (this.refreshAgain && !this.host.closing()) { this.refreshAgain = false; return run() }
+    }
+    this.refreshing = run().finally(() => { this.refreshing = undefined; this.release() })
+  }
+  /**
+   * Queues the launches of waiting tickets again: all of them once a candidate is healthy, and those still waiting for the
+   * first snapshot once there is one, so they can ask a person.
+   */
+  private release(): void {
+    if (!this.candidates.known) return
+    const healthy = this.candidates.pick() !== undefined
+    for (const ticketId of [...this.waiting]) {
+      if (!healthy && this.host.store.get(MULTICA_KV.waiting(ticketId))) continue
+      this.waiting.delete(ticketId)
+      const ticket = this.host.store.tickets.get(ticketId)
+      const latest = ticket && liveTicket(ticket) ? latestAssignment(ticket) : undefined
+      if (latest?.state === 'pending') this.start(ticket!, latest)
+    }
+  }
+  /** After a waiting ticket's issue was created: withdraws the question about starting a workstation, if it is still open. */
+  private dispatched(ticketId: string, agentId: string): void {
+    this.waiting.delete(ticketId)
+    if (!this.host.store.get(MULTICA_KV.waiting(ticketId))) return
+    const open = this.host.store.tickets.get(ticketId)?.attention?.question === this.noMachine()
+    if (open) this.record(ticketId, { state: 'progress', summary: `Dispatched to the Multica agent ${agentId}`, question: null })
+    this.host.store.delete(MULTICA_KV.waiting(ticketId))
   }
 
   /** Hands a ticket's waiting Inputs to its issue in one comment, or steers them into its running run; waits while a run waits to start. */
@@ -262,7 +342,7 @@ export class MulticaExecutor implements Executor {
     if (!latest || !liveTicket(latest) || runningAssignment(latest)?.id !== assignment.id) return
     try {
       const posted = await this.host.api.addComment(state.issueId, inputComment(messages), plan.kind === 'steer' ? { steer: [plan.runId] } : {})
-      const refused = refusedOutcome(posted.trigger_outcomes ?? undefined, this.host.config.agentId)
+      const refused = refusedOutcome(posted.trigger_outcomes ?? undefined, this.agentOf(state))
       if (refused) { this.host.engine.deliveryFailed(ticketId, assignment.id, `Multica did not take the message: ${refused}`); return }
       const steered = (posted.trigger_outcomes ?? []).some(outcome => outcome.status === 'steered')
       const saved = this.state(ticketId) ?? state
@@ -287,6 +367,8 @@ export class MulticaExecutor implements Executor {
 
   /** Routes a workspace event to the ticket whose issue it is about. */
   private event(event: MulticaEvent): void {
+    // Agent and runtime status changes, such as a workstation going offline, come as agent:, runtime: or daemon: events.
+    if (/^(agent|runtime|daemon):/.test(event.type) && !event.type.startsWith('daemon:heartbeat')) { this.refreshCandidates(); return }
     if (!/^(task|comment|issue):/.test(event.type)) return
     const issueId = issueOf(event)
     const ticketId = issueId && this.host.store.get(MULTICA_KV.issue(issueId))
@@ -316,7 +398,7 @@ export class MulticaExecutor implements Executor {
     if (!state || !ticket || !liveTicket(ticket)) return
     const [runs, comments] = await Promise.all([this.host.api.runs(state.issueId), this.host.api.comments(state.issueId)])
     // Reports first, so a report and the end of the turn that made it arrive in that order.
-    const fresh = comments.filter(comment => comment.author_type === 'agent' && comment.author_id === this.host.config.agentId
+    const fresh = comments.filter(comment => comment.author_type === 'agent' && comment.author_id === this.agentOf(state)
       && !state.seen.includes(comment.id)).sort((a, b) => a.created_at.localeCompare(b.created_at))
     const refused: Refusal[] = []
     for (const comment of fresh) refused.push(...await this.apply(ticketId, state, comment))
@@ -349,14 +431,17 @@ export class MulticaExecutor implements Executor {
   private runFailure(run: Run): string {
     return `The Multica run ${run.id} failed${run.error ? `: ${run.error}` : ''}. Its messages (multica issue run-messages ${run.id}) tell why.`
   }
-  private reportFailed(ticketId: string, summary: string): void {
+  private reportFailed(ticketId: string, summary: string): void { this.record(ticketId, { state: 'failed', summary }) }
+  /** Records the executor's own report on the ticket, relays it to the main Session, and runs `also` in the same transaction. */
+  private record(ticketId: string, report: WorkerReport, also?: () => void): void {
     try {
       this.host.store.atomic(() => {
-        const updated = this.host.engine.report(ticketId, { state: 'failed', summary })
-        const relay = reportRelay(updated, { state: 'failed', summary })
+        const updated = this.host.engine.report(ticketId, report)
+        const relay = reportRelay(updated, report)
         if (relay) this.host.sessions.relay(relay.id, relay.text)
+        also?.()
       })
-    } catch (error) { this.failure('Recording a failure', error) }
+    } catch (error) { this.failure(`Recording a ${report.state} report`, error) }
   }
 
   /** Applies the report blocks of one agent comment for the ticket's current Assignment; returns the blocks it refused. */
