@@ -63,14 +63,19 @@ def ps(*options, check=False):
             yield int(parts[0]), parts[1], parts[2].split()
 
 
+def is_dsh(name, args):
+    """Return whether a process is node or dsh; Node 24 on Linux renames its main thread, so `ucomm` reads `MainThread` and the executable name decides."""
+    return name in ('node', 'dsh') or (bool(args) and os.path.basename(args[0]) in ('node', 'dsh'))
+
+
 def running(pid, profile):
     """Return whether `pid` is currently running the DSH service for `profile` (`ps -p` returns nothing once exited)."""
-    return any(found == pid and name in ('node', 'dsh') and serves(args, profile) for found, name, args in ps('-p', str(pid)))
+    return any(found == pid and is_dsh(name, args) and serves(args, profile) for found, name, args in ps('-p', str(pid)))
 
 
 def processes(profile):
     """Return PIDs of all running DSH service processes for `profile`, including instances started outside this script and the recorded `service.pid` while still running."""
-    found = [pid for pid, name, args in ps('-ax', check=True) if name in ('node', 'dsh') and serves(args, profile)]
+    found = [pid for pid, name, args in ps('-ax', check=True) if is_dsh(name, args) and serves(args, profile)]
     try:
         pid = int((control(profile) / 'service.pid').read_text())
     except (OSError, ValueError):
