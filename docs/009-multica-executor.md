@@ -243,7 +243,7 @@ daemon_id 是机器级的，存在 `~/.multica/daemon.id`，CLI daemon 与桌面
 
 1. ~~回报被拒只记在 `worker` 健康项里~~：已做，见上「回报被拒的反馈」与第 8.1 节。
 2. ~~多候选 agent~~：已做，见上「多候选」。跨机故障转移与改派（第 4 节第 2、2b 层）还没做。
-3. ~~线上端到端联调~~：GitHub 入口已跑通，见第 8.2 节；飞书私聊入口还没跑。
+3. ~~线上端到端联调~~：GitHub 与飞书私聊入口都已跑通到 PR 合并、Ticket 结束，见第 8.2 节。
 4. 第 7 节第 5、6 项（各 runtime 对协议的遵从度、MCP 注入）。
 
 ### 8.1 反馈评论会不会引出新 run
@@ -288,6 +288,23 @@ daemon_id 是机器级的，存在 `~/.multica/daemon.id`，CLI daemon 与桌面
 | 12:09:21 | 两条合并成**一条**投递评论，起**一个** run（`01a1ab9d`），两处改动一起完成并推送 |
 | 12:11:37 → 12:12:50 | run `01a1ab9e-46cc` 运行中，12:11:51–12:12:03 重启服务器；run 不受影响，12:12:43 贴回报，重启后的对账追上 |
 | 12:12:50 | 该 run 以 `failed` 结束：jxccs 上 opencode 报 `Free usage limit reached`（与重启无关），Ticket 记为 `failed` |
+| 13:37:51 | 合并 PR #7；13:38:43 Ticket 结束（`ended`），#6 随 PR 关闭 |
+
+**换 runtime**：opencode 免费额度用完后，新建 agent `superagent-worker-jxccs-codebuddy`（`multica agent copy` 到 jxccs 的 Codebuddy runtime，
+模型 `deepseek-v4.1-flash`，说明照搬，同样不支持 steer），`MULTICA_AGENT_IDS` 改为它。备选模型 `glm-5.3-flash` 在本机也能回话。
+
+**飞书私聊入口时间线（与机器人的私聊 → Multica JAR-55 → PR #8，UTC）**：
+
+| 时间 | 事件 |
+| --- | --- |
+| 13:42:18 | 以操作者身份私聊发需求；13:42 确认回复出现在该消息的回复串里。但 run 仍派给旧的 opencode agent 并立即失败（缺陷 5） |
+| 13:59:59 | 修复部署、停掉上一张后再发一次：建 issue 返回 409 `active_duplicate_issue`（缺陷 6），Ticket 记为启动失败 |
+| 14:28:55 | 修复部署后在面板重试该 Ticket |
+| 14:29:08 → 14:30:03 | 新 Assignment 建 JAR-55（指派 codebuddy agent，metadata 反查到 Ticket），约 1 分钟推送分支、开 PR #8，`ready` 回报；回复串里出现「已提交 PR #8」 |
+| 14:31:16 | CodeRabbit 的 walkthrough 作为 Input 只投递一次、一个 run（缺陷 2 修复后的表现） |
+| 14:37:51 | 合并 PR #8；14:37:52 Ticket 结束 |
+
+PR #8 的作者与提交作者都是 `jaredwtt1203`。
 
 **发现的缺陷（均已修，带测试）**：
 
@@ -300,6 +317,13 @@ daemon_id 是机器级的，存在 `~/.multica/daemon.id`，CLI daemon 与桌面
 3. **对账会自动重投递已失败的投递**：真被 `blocked` 时，每个 `comment:created` 事件都会再发一条评论。修法：Ticket 带投递错误时对账不再投递。网络类失败仍由 effect 队列退避重试（成功即清掉错误）；被 Multica 明确拒收的投递要等下一条 Input、新 Assignment 或 Ticket 结束才再投。
 4. **同一 Ticket 的两次投递并发**（11:56:48 两条相同评论）：Engine 与对账各排了一次投递。修法：每个 Ticket 的投递串行执行。
 
+5. **改了环境文件、用 login shell 重启，服务仍拿旧变量**（`scripts/dsh-superagent`，上游代码）：tmux 会话还在时脚本开新窗口，窗口继承的是
+   早已在跑的 tmux server 的全局环境，不是执行 `restart` 的 shell 的。修法：`start` 把自己的环境写成控制目录下 0600 的快照，窗口里的启动器读入、
+   删除后 `execve` 成 dsh；PID 不变，值不上命令行，tmux 启动失败时快照也删掉。
+6. **同标题的活跃 issue 让建 issue 失败**（`multica-api.ts`）：被停掉的 Ticket 的 issue 仍是 `todo`，Multica 拒绝再建同标题的活跃 issue（409
+   `active_duplicate_issue`）。每个 Ticket 本就一个 issue，所以建 issue 时带 `allow_duplicate: true`。
+   代价：建 issue 后、存盘前崩溃的话，重试会再建一个（窗口只有一次 HTTP 响应到同步存盘之间）。
+
 **观察**：
 
 - 非 steer runtime 上，run 运行中进来的 Input 会立即发评论、排一个后续 run（12:10:28、12:10:39 两条 bot Input 各一条评论），符合第 7.1 节规则 3；
@@ -309,4 +333,6 @@ daemon_id 是机器级的，存在 `~/.multica/daemon.id`，CLI daemon 与桌面
 - 放宽 `refusedOutcome` 的代价：评论确实没触发任何 run（如 issue 被取消指派）时会被记为已投递，只剩 `deliveries[].read` 一直为 false；
   steer 投递若没有 outcome 也会被当作成功（本次 runtime 不能 steer，未实测）。
 
-**还没验证**：飞书私聊入口；Ticket 随 PR 合并结束（PR #7 待人工合并）；重启中的 run 正常结束（那个 run 因 jxccs 上 opencode 免费额度用完而 failed）。
+- Ticket 结束（停止或 PR 合并）时 Multica issue 不会关闭（JAR-53/54/55 仍是 in_review / todo），工作区里会积累活跃 issue。
+
+**还没验证**：重启中的 run 正常结束（那个 run 因 jxccs 上 opencode 免费额度用完而 failed，但重启本身没有打断它）。
