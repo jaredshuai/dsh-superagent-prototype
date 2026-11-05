@@ -243,7 +243,7 @@ daemon_id 是机器级的，存在 `~/.multica/daemon.id`，CLI daemon 与桌面
 
 1. ~~回报被拒只记在 `worker` 健康项里~~：已做，见上「回报被拒的反馈」与第 8.1 节。
 2. ~~多候选 agent~~：已做，见上「多候选」。跨机故障转移与改派（第 4 节第 2、2b 层）还没做。
-3. 线上端到端联调：在服务器上设置上述环境变量，用测试 agent 跑一张真实 Ticket。
+3. ~~线上端到端联调~~：GitHub 入口已跑通，见第 8.2 节；飞书私聊入口还没跑。
 4. 第 7 节第 5、6 项（各 runtime 对协议的遵从度、MCP 注入）。
 
 ### 8.1 反馈评论会不会引出新 run
@@ -263,3 +263,47 @@ daemon_id 是机器级的，存在 `~/.multica/daemon.id`，CLI daemon 与桌面
   `/note superagent: probe for issue #3 …`（评论 `01a1aae8-f246-7f3d-bc3f-22580c916e4a`，`parent_id` 正确）；08:52:59Z 再查 `multica issue runs JAR-49`，
   仍是原来的 2 个 completed run，没有新 run。线上行为与源码一致，不需要退路（让 Worker 识别并忽略 `/note superagent:` 触发的 run）。
 
+
+## 8.2 线上端到端联调（2026-11-05，#5）
+
+**部署**：服务器 `superagent-sv`（`~/src/dsh-superagent`，`multica-executor` 分支）。`~/.config/superagent.env`（由 `~/.profile` 引入）追加
+`SUPERAGENT_EXECUTOR=multica`、`MULTICA_WORKSPACE_ID`、`MULTICA_AGENT_IDS=<superagent-worker-jxccs>`、`SUPERAGENT_MULTICA_REPOSITORY`、
+`SUPERAGENT_MULTICA_INSTRUCTIONS`（git/gh 一律用 `git-agent` / `gh-agent`）；`MULTICA_TOKEN` 从工作站 `~/.multica/config.json` 经 SSH 管道直接追加，
+不经终端。`bash -lc "scripts/dsh-superagent restart"` 重启后 `worker` 健康项为 `Connected to Multica`。
+切换前先停掉了两张 DshExecutor 开的旧 Ticket：MulticaExecutor 对没有 `multica-ticket:` 状态的 Ticket 不投递，留着只会一直挂着。
+
+**GitHub 入口时间线（superagent-sandbox #6 → Multica JAR-53 → PR #7，UTC）**：
+
+| 时间 | 事件 |
+| --- | --- |
+| 11:38:24 | 开 issue #6，正文 @ Agent 账号。**未成为 Ticket**（缺陷 1） |
+| 11:53:40 | 修复部署后，在 #6 再评论一次 @ |
+| 11:54:41 | Ticket 建立、Assignment 开始；JAR-53 metadata `superagent_ticket` 即 Ticket id |
+| 11:54:42 | 确认回复出现在 #6 |
+| 11:55:58 | Worker（jxccs，opencode）推送 `agent/add-multica-github-md-7de356b6e77f`、开 PR #7，贴 `ready` 回报块 |
+| 11:56:09 | 面板 Ticket 进入「待人工 review」。PR 作者、提交作者均为 `jaredwtt1203` |
+| 11:56:48 | CodeRabbit 的额度提示评论作为 Input 进来，**被反复投递**（缺陷 2）：每个 run 结束后再发一遍，共 8 轮；11:59:13 暂停执行器止住 |
+| 12:06 | 修复部署、恢复执行器：暂停前已排队的那次投递又发了一次，这次记为已投递，之后不再重发 |
+| 12:08:43 / 12:08:52 | 在 #6 追加两条消息 |
+| 12:09:21 | 两条合并成**一条**投递评论，起**一个** run（`01a1ab9d`），两处改动一起完成并推送 |
+| 12:11:37 → 12:12:50 | run `01a1ab9e-46cc` 运行中，12:11:51–12:12:03 重启服务器；run 不受影响，12:12:43 贴回报，重启后的对账追上 |
+| 12:12:50 | 该 run 以 `failed` 结束：jxccs 上 opencode 报 `Free usage limit reached`（与重启无关），Ticket 记为 `failed` |
+
+**发现的缺陷（均已修，带测试）**：
+
+1. **GitHub 通知晚到被游标越过**（`src/sources/github.ts`，上游代码）：通知的 `updated_at` 是 11:38:48，但 GitHub 列出它晚于下一轮游标
+   （轮次开始 − 5 s），之后 `since=` 再也取不到。修法：列表比游标往前多取 10 分钟，晚到的通知从那里读；窗口内已处理的通知按 id + `updated_at`
+   记在 `github-notified`，原样再出现不重读。
+2. **投递被误判为失败而循环重发**（`multica-protocol.ts` `refusedOutcome`）：Multica 的 `trigger_outcomes` 只列评论里**显式 @** 的 agent
+   （`server/internal/handler/comment.go` `commentTriggerOutcomes`，assignee 兜底不产生 outcome），普通投递评论回来是空列表，被当成「未触发 agent」记
+   `deliveryFailed`；对账见到 Input 仍未投递、又没有排队 run，就再发一次，每次都真起一个 run。修法：只有点名本 agent 的 outcome 才能判拒收。
+3. **对账会自动重投递已失败的投递**：真被 `blocked` 时，每个 `comment:created` 事件都会再发一条评论。修法：Ticket 带投递错误时对账不再投递，等下一条 Input 或重试。
+4. **同一 Ticket 的两次投递并发**（11:56:48 两条相同评论）：Engine 与对账各排了一次投递。修法：每个 Ticket 的投递串行执行。
+
+**观察**：
+
+- 非 steer runtime 上，run 运行中进来的 Input 会立即发评论、排一个后续 run（12:10:28、12:10:39 两条 bot Input 各一条评论），符合第 7.1 节规则 3；
+  只在已有排队 run 时才等待合并。
+- 远端 Worker 对重复投递很「诚实」（回报里写「第 N 次重复投递」），但每轮仍是完整的 run，费用照算：投递必须一次准确。
+
+**还没验证**：飞书私聊入口；Ticket 随 PR 合并结束（PR #7 待人工合并）。
