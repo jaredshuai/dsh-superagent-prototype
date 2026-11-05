@@ -211,6 +211,30 @@ it('starts the service in a new window of the profile\'s tmux session when the s
   expect(calls.find(call => call[0] === 'new-window')).toEqual(expect.arrayContaining(['-t', '=dsh-superagent:']))
   expect(calls.some(call => call[0] === 'new-session')).toBe(false)
 }, 20_000)
+it('starts the service with the environment of the shell that ran start, not the tmux server\'s, keeping it off the command line', async () => {
+  // Live, #5: a variable added to the env file and a login-shell restart never reached the service, because the window
+  // took the environment of the tmux server that was already running.
+  program('tmux', `for a in "$@"; do printf '%s\\n' "$a"; done >> '${root}/tmux.log'; echo --- >> '${root}/tmux.log'\n`
+    + `case "$1" in has-session) exit 0;; new-*) touch '${root}/launched'; cat '${root}/pane';; esac`)
+  program('dsh', `env > '${root}/dsh-env'`)
+  const url = await answering()
+  const pid = sleeper()
+  writeFileSync(join(root, 'pane'), `${pid}\n`)
+  started(service(pid))
+  const result = await new Promise<number>(resolve => execFile('python3', [join(root, 'scripts', 'dsh-superagent'), 'start', '--url', url,
+    '--timeout', '10'], { env: { ...process.env, PATH: `${join(root, 'bin')}:${process.env.PATH}`, DSH_SUPERAGENT_PROFILE: '',
+    DSH_SUPERAGENT_URL: '', SUPERAGENT_TEST_SECRET: 's3cret' }, timeout: 20_000 }, error => resolve(typeof error?.code === 'number' ? error.code : 0)))
+  expect(result).toBe(0)
+  const log = readFileSync(join(root, 'tmux.log'), 'utf8')
+  expect(log).not.toContain('s3cret')
+  const command = log.split('---\n').map(call => call.split('\n')).find(call => call[0] === 'new-window')!.find(word => word.startsWith('umask 077; '))!
+  // The window runs it as the tmux server would: without the variable.
+  const { SUPERAGENT_TEST_SECRET: _gone, ...server } = { ...process.env, PATH: `${join(root, 'bin')}:${process.env.PATH}` }
+  await new Promise<void>(resolve => execFile('sh', ['-c', command], { env: server, cwd: root }, () => resolve()))
+  expect(readFileSync(join(root, 'dsh-env'), 'utf8')).toContain('SUPERAGENT_TEST_SECRET=s3cret')
+  // The snapshot is read once and gone.
+  expect(readdirSync(control('superagent')).filter(name => name.includes('env'))).toEqual([])
+}, 20_000)
 it('exits 1 when the started service does not answer in time, and leaves its process running', async () => {
   const pid = sleeper()
   writeFileSync(join(root, 'pane'), `${pid}\n`)

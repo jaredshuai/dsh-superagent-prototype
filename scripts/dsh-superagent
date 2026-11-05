@@ -23,6 +23,9 @@ import urllib.request
 
 ROOT = Path(__file__).resolve().parent.parent
 ARTIFACTS = ROOT / '.artifacts'
+# Runs in the tmux window: loads the environment snapshot `start` wrote, deletes it, and becomes the service.
+LAUNCHER = ('import json, os, sys; path = sys.argv[1]; environment = json.load(open(path)); os.unlink(path); '
+            'os.execve(sys.argv[2], sys.argv[2:], environment)')
 CONTROL = ARTIFACTS / 'control'
 KEEP_LOGS = 20
 
@@ -178,13 +181,24 @@ def start(args):
         log = ARTIFACTS / f'dsh-superagent-{args.profile}-{stamp}-{os.getpid()}.log'
         log.touch()
         prune_logs(args.profile)
-        # `exec` replaces the shell so the pane PID printed by tmux is the DSH service process itself.
-        command = ('umask 077; exec ' + shlex.join([dsh, '--profile', args.profile, '--no-open'])
-                   + ' >> ' + shlex.quote(str(log)) + ' 2>&1')
+        # A new window takes the environment of the tmux server, which may predate this shell's, such as a variable just
+        # added to the env file. The service gets this shell's environment from a private snapshot instead, which the
+        # launcher reads, deletes and replaces itself with, so no value reaches a command line.
+        snapshot = control(args.profile) / f'launch-env-{os.getpid()}.json'
+        descriptor = os.open(snapshot, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(descriptor, 'w') as handle:
+            json.dump(dict(os.environ), handle)
+        # `exec` and `execve` replace the shell and the launcher so the pane PID printed by tmux is the DSH service process itself.
+        command = ('umask 077; exec ' + shlex.join([sys.executable, '-c', LAUNCHER, str(snapshot), dsh, '--profile', args.profile,
+                                                    '--no-open']) + ' >> ' + shlex.quote(str(log)) + ' 2>&1')
         # Reuse an existing tmux session without disturbing other windows.
         target = ['new-window', '-t', '=' + session + ':'] if exists else ['new-session', '-s', session]
-        pane = subprocess.run(['tmux', *target, '-d', '-P', '-F', '#{pane_pid}', '-n', 'server', '-c', str(ROOT), command],
-                              check=True, capture_output=True, text=True).stdout.strip()
+        try:
+            pane = subprocess.run(['tmux', *target, '-d', '-P', '-F', '#{pane_pid}', '-n', 'server', '-c', str(ROOT), command],
+                                  check=True, capture_output=True, text=True).stdout.strip()
+        except BaseException:
+            snapshot.unlink(missing_ok=True)
+            raise
         if pane.isdigit():
             (control(args.profile) / 'service.pid').write_text(pane + '\n')
         print('Log: ' + str(log), flush=True)
