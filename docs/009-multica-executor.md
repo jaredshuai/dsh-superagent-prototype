@@ -256,7 +256,7 @@ daemon_id 是机器级的，存在 `~/.multica/daemon.id`，CLI daemon 与桌面
 1. ~~回报被拒只记在 `worker` 健康项里~~：已做，见上「回报被拒的反馈」与第 8.1 节。
 2. ~~多候选 agent~~：已做，见上「多候选」。跨机故障转移与改派（第 4 节第 2、2b 层）还没做（#8）。
 3. ~~线上端到端联调~~：GitHub 与飞书私聊入口都已跑通到 PR 合并、Ticket 结束，见第 8.2 节。
-4. 第 7 节第 5、6 项（各 runtime 对协议的遵从度 #7、MCP 注入），以及 steer 投递路径的线上实测（#6：源码结论与修复见第 8.3 节，线上一轮待跑）。
+4. 第 7 节第 5、6 项（各 runtime 对协议的遵从度 #7、MCP 注入），steer 投递路径已在线上实测（#6，第 8.3 节）。
 5. ~~Ticket 结束时关闭 issue~~：已做（#9），见上「Ticket 结束时关闭 issue」。
 
 ### 8.1 反馈评论会不会引出新 run
@@ -379,9 +379,28 @@ PR #8 的作者与提交作者都是 `jaredwtt1203`。
   原评论已不在的，丢掉记录不再发。回执靠 `comment:updated` 推送触发对账，不轮询（ADR 0002）。
   代价：timeline 截断（单 issue 超过约 2000 条评论/活动）时回执可能取不到，run 已结束就会误补发一次。
 
-**线上实测：待跑。** 需要在 Multica 工作区建一个绑定 jxccs 上 Claude runtime 的测试 agent（如 `multica agent copy <superagent-worker-jxccs-codebuddy>
---runtime-id <Claude (jxccs)> --model sonnet --name superagent-worker-jxccs-claude`），把服务器的 `MULTICA_AGENT_IDS` 指向它，部署本修复后：
+**线上实测（2026-11-06，UTC，superagent-sandbox #9 → Multica JAR-56 → PR #10）：**
 
-1. 发一个要跑一两分钟的需求；run 进行中追加一条消息。期望：投递评论的响应带 `supplements[].status = pending`，issue 上没有多出排队 run，
-   回执随后变为 `delivered`，Ticket 上该 Input 记为已读，Worker 在同一个 run 里回应。
-2. run 快结束时再追加一条，争取落到「绑定后、交付前 run 结束」：期望回执 `failed` / `turn_ended`，执行器补发一条普通评论，起一个后续 run 读到它。
+准备：`multica agent copy` 出 `superagent-worker-jxccs-claude`（`a715c90e-364d-4613-9ecf-22e285576f75`，jxccs 的 Claude runtime，模型 `sonnet`，说明照搬），
+服务器 `MULTICA_AGENT_IDS` 改为它。**部署要先 `pnpm build` 再重启**：服务跑的是 `lib/` 里的构建产物，只 `git pull` + `restart` 仍是旧代码（第一轮就是这样）。
+
+| 时间 | 事件 |
+| --- | --- |
+| 01:15:10 | （旧代码）追加需求「`sleep 240` 后加一行」，起 run `01a1ae6c` |
+| 01:16:19 | 第二条追加 steer 进该 run：回执 `pending` → 01:16:25 `delivering` → 01:19:23 `delivered`；Worker 01:19:42 在**同一个 run** 里一并做完两条。但执行器把它记成普通投递、`read` 一直为 false（**缺陷 7 线上复现**） |
+| 01:19:47 | （旧代码）CI 结果 steer 进正要结束的 `01a1ae6c`，回执 `failed` / `turn_ended`；执行器没有补发，这条 Input 再没送到 Worker（**缺陷 8 线上复现**） |
+| 约 01:22 | 服务器 `pnpm build` 后重启，跑本修复 |
+| 01:25:20 / 01:26:3x | 追加需求起 run `01a1ae75`（`sleep 150`）；第二条追加 steer 进去，执行器记 `steeredRun=01a1ae75…`、`read=false` |
+| 01:28:02 | 回执 `delivered`，执行器随即把该 Input 记为已读；01:28:10 Worker 在同一个 run 里一次提交两行。issue 上没有为它多出 run |
+| 01:28:52 | CodeRabbit 的摘要 steer 进 run `01a1ae78`，2 s 后 `delivered`、记为已读 |
+| 01:39:12 / 01:40:15 | 场景 2：需求起 run `01a1ae82`（`sleep 300`），补充消息 steer 进去，回执 `delivering`；01:40:25 操作者取消该 run |
+| 01:40:24 | 回执 `failed` / `turn_ended`；执行器把原内容作为普通评论补发（`01a1ae83-a2f3…`），起后续 run `01a1ae83`，01:40:41 回报「已读到场景 2 测试消息」，Input 记为已读 |
+
+**结论**：
+
+- steer 路径成立：run 进行中追加的消息注入同一个 run，不多排 run；执行器按 `supplements[]` 回执认出 steer，回执 `delivered` 时记已读。
+- Claude 只在两次工具调用之间收下补充消息：Worker 正在跑长命令（`sleep 240`）时回执停在 `delivering`，命令结束才 `delivered`（约 3 min）。
+  所以「Input 已读」比 steer 发出晚得多，这正是改成等 `delivered` 再记已读的理由。
+- run 在交付前结束（场景 2 用取消复现；01:19:47 是自然发生的）时，修复后的执行器补发、消息不丢；修复前会丢。
+- 「超出 steer 限额」对执行器不会出现（见上，member 不受限），线上未构造。
+- 遗留：修复前那两条投递（`01a1ae6d…`、`01a1ae70-c194…`）的记录仍是 `read=false`；它们没有 `steeredRun`，对账不再看它们，不影响后续投递，未清理。
