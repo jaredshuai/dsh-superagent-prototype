@@ -91,6 +91,16 @@ export class Assignments extends EnginePart {
     else if (ticket.undelivered.length) this.options.executor.deliver(ticket, running)
   }
   /**
+   * Replaces a running Assignment the Executor moved to another worker, such as after its workstation went offline, with a
+   * new one that receives `note` first. The Executor stopped the old one itself, so it is not told to stop it.
+   */
+  reassigned(ticketId: string, assignmentId: string, note: string): void {
+    const ticket = this.running(ticketId, assignmentId)
+    const running = ticket && runningAssignment(ticket)
+    if (!ticket || !running) return
+    this.tickets.restart(ticket, running, 'reassigned', note)
+  }
+  /**
    * Records a worker status report on an open ticket's current assignment, updating `attention`, `answers`, held automated
    * inputs, and ending the ticket when `dropped` or when `ready` and not waiting on followed threads (`followsDone`).
    * @throws UserError for an unknown or ended ticket, an ended assignment, a question combined with a ready result or answer,

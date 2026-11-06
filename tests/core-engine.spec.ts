@@ -731,6 +731,24 @@ describe('interrupted assignments', () => {
     expect(h.repo.tickets.get(other)!.assignments.map(item => item.state)).toEqual(['ended', 'pending'])
   })
 })
+describe('reassigned assignments', () => {
+  it('replaces a running Assignment its Executor moved to another worker with one that receives the note first', () => {
+    const h = harness()
+    const ticketId = accepted(h).ticketId!
+    const first = runningAssignment(h.repo.tickets.get(ticketId)!)!
+    vi.mocked(h.executor.start).mockClear(); vi.mocked(h.executor.stop).mockClear()
+    h.engine.assignmentReassigned(ticketId, first.id, 'Moved to another workstation')
+    // A fact about one that no longer runs is dropped.
+    h.engine.assignmentReassigned(ticketId, first.id, 'again')
+    const ticket = h.repo.tickets.get(ticketId)!
+    expect(ticket.assignments).toEqual([expect.objectContaining({ id: first.id, state: 'ended', endedReason: 'reassigned' }),
+      expect.objectContaining({ state: 'pending' })])
+    expect(ticket.inputs.filter(input => input.kind === 'text')).toEqual([expect.objectContaining({ text: 'Moved to another workstation' })])
+    expect(h.executor.start).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ id: ticketId }), ticket.assignments[1])
+    // The Executor stopped the old one itself.
+    expect(h.executor.stop).not.toHaveBeenCalled()
+  })
+})
 describe('pause', () => {
   it('lets no Eval expire while processing is paused, and moves its deadline on by the pause\'s length', () => {
     const h = harness()

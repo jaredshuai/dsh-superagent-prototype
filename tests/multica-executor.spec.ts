@@ -48,7 +48,17 @@ function setup(initial: Ticket, options: { agents?: string[]; pickHealthy?: bool
   const receipts = new Map<string, SteerReceipt[]>()
   let outcome = 'queued'
   let postFailures = 0
+  /** A fake clock: `advance` moves it on and fires the timers that fall due. */
+  let clockNow = Date.parse('2026-11-05T00:00:00Z')
+  const timers: { at: number; fn: () => void; cancelled: boolean }[] = []
+  const clock = {
+    now: () => clockNow,
+    after: (ms: number, fn: () => void) => { const timer = { at: clockNow + ms, fn, cancelled: false }; timers.push(timer); return () => { timer.cancelled = true } },
+  }
+  /** Run messages by run id. */
+  const messages = new Map<string, { type: string; content?: string; output?: string }[]>()
   const engine = {
+    assignmentReassigned: vi.fn(),
     assignmentStarted: vi.fn(), inputsDelivered: vi.fn(), inputsRead: vi.fn(), turnEnded: vi.fn(), deliveryFailed: vi.fn(),
     report: vi.fn(() => ticket), reply: vi.fn(() => ({ id: 'r', status: 'sent', reused: false })), handback: vi.fn(() => true),
     followForContext: vi.fn(() => true), markUnrelated: vi.fn(),
@@ -76,7 +86,9 @@ function setup(initial: Ticket, options: { agents?: string[]; pickHealthy?: bool
       return { ...comment, trigger_outcomes: content.startsWith('/note') || outcome === 'none' ? [] : [{ status: outcome, target_id: AGENT }] }
     }),
     steerReceipts: vi.fn(async () => new Map([...receipts].map(([id, list]) => [id, list.map(receipt => ({ ...receipt }))]))),
-    cancelRun: vi.fn(async () => {}),
+    cancelRun: vi.fn(async (id: string) => { const run = runs.find(item => item.id === id); if (run) run.status = 'cancelled' }),
+    assignIssue: vi.fn(async (_issue: string, _agent: string) => {}),
+    runMessages: vi.fn(async (id: string) => messages.get(id) ?? []),
     setStatus: vi.fn(async (_issue: string, _status: string) => {}),
     agents: vi.fn(async () => agents.map(agent => ({ ...agent }))),
     runtimes: vi.fn(async () => runtimes.map(runtime => ({ ...runtime }))),
@@ -97,13 +109,13 @@ function setup(initial: Ticket, options: { agents?: string[]; pickHealthy?: bool
     config: { serverUrl: 'https://multica.test', workspaceId: 'w', token: 'mul_x', agents: options.agents ?? [AGENT],
       pickHealthy: options.pickHealthy ?? false, repository: 'https://github.com/o/r' },
     socketFactory: () => { const socket = new FakeSocket(); sockets.push(socket); return socket },
-    closing: () => false, paused: () => false,
+    closing: () => false, paused: () => false, clock,
     sourceLink: async () => ({ source_url: 'https://github.com/o/r/issues/2' }), repliedTo: () => undefined, sendReplies: vi.fn(async () => {}),
     claimPull: vi.fn(async (): Promise<string | undefined> => undefined),
   } as unknown as MulticaExecutorHost
   let executor = new MulticaExecutor(host)
   return {
-    get executor() { return executor }, engine, api, runs, comments, posted, receipts, enqueued, health, host, agents, runtimes,
+    get executor() { return executor }, engine, api, messages, runs, comments, posted, receipts, enqueued, health, host, agents, runtimes,
     /** Connects the event stream, or completes the reconnection `drop` started, and lets the catch-up finish. */
     connect: async () => {
       if (!sockets.length) executor.install()
@@ -131,6 +143,14 @@ function setup(initial: Ticket, options: { agents?: string[]; pickHealthy?: bool
     state: () => kv.get(MULTICA_KV.ticket('t1')) as MulticaTicketState | undefined,
     setTicket: (next: Ticket) => { ticket = next },
     setOutcome: (next: string) => { outcome = next },
+    /** Moves the fake clock on by `ms`, fires the timers due, and lets what they started finish. */
+    advance: async (ms: number) => {
+      clockNow += ms
+      for (const timer of timers.filter(item => !item.cancelled && item.at <= clockNow)) { timer.cancelled = true; timer.fn() }
+      await settle()
+    },
+    /** The fake clock's time, as an ISO string `ms` from now. */
+    at: (ms = 0) => new Date(clockNow + ms).toISOString(),
     launch: (assignmentId = 'a1') => handlers.launch!({ ticketId: 't1', assignmentId } as never),
     deliver: () => handlers.delivery!({ ticketId: 't1' } as never),
   }
@@ -741,6 +761,158 @@ describe('MulticaExecutor', () => {
       await h.push({ type: 'daemon:register', actor_type: 'system', payload: { action: 'heartbeat_recovery' } })
       await h.runLaunches()
       expect(assignedTo(h)).toEqual(['a-ok'])
+    })
+
+    describe('reassigning across workstations (#8)', () => {
+      const MINUTE = 60_000
+      /** A ticket launched on `a-ok`, whose Assignment runs. */
+      async function launched() {
+        const h = candidates()
+        keepQuestions(h)
+        await h.connect()
+        await h.launch()
+        h.setTicket(ticketWith([{}]))
+        return h
+      }
+      /** The Engine replaces the Assignment, as the real one does, and the new one launches on the same issue. */
+      async function relaunch(h: ReturnType<typeof setup>) {
+        h.setTicket(ticketWith([{ state: 'ended', endedReason: 'reassigned' }, { state: 'pending' }]))
+        await h.launch('a2')
+        h.setTicket(ticketWith([{ state: 'ended', endedReason: 'reassigned' }, {}]))
+      }
+
+      it('moves a run nobody claimed for 5 minutes to the next healthy candidate, but not one queued through a 3-minute switch', async () => {
+        const h = await launched()
+        h.runs.push({ id: 'r1', status: 'queued', created_at: h.at() } as Run)
+        await h.executor.reconcile('t1')
+        await h.advance(3 * MINUTE)
+        expect(h.api.cancelRun).not.toHaveBeenCalled()
+        expect(h.engine.assignmentReassigned).not.toHaveBeenCalled()
+        await h.advance(2 * MINUTE)
+        expect(h.api.cancelRun).toHaveBeenCalledWith('r1')
+        expect(h.api.assignIssue).toHaveBeenCalledWith('issue-1', 'a-ok-2')
+        // Cancelled before the issue moved, so no two runs are active at once.
+        expect(h.api.cancelRun.mock.invocationCallOrder[0]!).toBeLessThan(h.api.assignIssue.mock.invocationCallOrder[0]!)
+        expect(h.engine.assignmentReassigned).toHaveBeenCalledExactlyOnceWith('t1', 'a1', expect.stringContaining('another workstation'))
+        expect(h.state()).toMatchObject({ agentId: 'a-ok-2' })
+        expect(h.state()!.assignment).toBeUndefined()
+        await relaunch(h)
+        expect(h.posted.at(-1)!.content).toContain('A new assignment `a2`')
+        expect(h.state()).toMatchObject({ agentId: 'a-ok-2', assignment: { id: 'a2' } })
+      })
+
+      it('leaves a claimed run alone however long it runs', async () => {
+        const h = await launched()
+        h.runs.push({ id: 'r1', status: 'running', created_at: h.at() } as Run)
+        await h.executor.reconcile('t1')
+        await h.advance(30 * MINUTE)
+        await h.executor.reconcile('t1')
+        expect(h.engine.assignmentReassigned).not.toHaveBeenCalled()
+      })
+
+      it('moves a run that failed because its runtime went offline, cancelling the retry Multica deferred for it', async () => {
+        const h = await launched()
+        h.runs.push({ id: 'r1', status: 'running', created_at: h.at() } as Run)
+        await h.executor.reconcile('t1')
+        h.runs[0]!.status = 'failed'
+        Object.assign(h.runs[0]!, { failure_reason: 'runtime_offline', error: 'runtime went offline' })
+        h.runs.push({ id: 'r2', status: 'deferred', created_at: h.at() } as Run)
+        await h.executor.reconcile('t1')
+        expect(h.api.cancelRun).toHaveBeenCalledWith('r2')
+        expect(h.api.assignIssue).toHaveBeenCalledWith('issue-1', 'a-ok-2')
+        expect(h.engine.assignmentReassigned).toHaveBeenCalledWith('t1', 'a1', expect.stringContaining('runtime_offline'))
+        // Not the worker's failure, and not the end of its turn.
+        expect(h.engine.report).not.toHaveBeenCalledWith('t1', expect.objectContaining({ state: 'failed' }))
+        expect(h.engine.turnEnded).not.toHaveBeenCalled()
+      })
+
+      it('moves a run whose messages say its CLI is logged out at once, and keeps that candidate out for a while', async () => {
+        const h = await launched()
+        h.runs.push({ id: 'r1', status: 'failed', created_at: h.at(), error: 'agent exited with code 1', failure_reason: 'agent_error' } as Run)
+        h.messages.set('r1', [{ type: 'error', content: 'Error: Not logged in. Please run codebuddy login.' }])
+        await h.executor.reconcile('t1')
+        expect(h.api.runMessages).toHaveBeenCalledWith('r1')
+        expect(h.api.assignIssue).toHaveBeenCalledWith('issue-1', 'a-ok-2')
+        await relaunch(h)
+        // a-ok is still healthy by its runtime, but out: with a-ok-2 offline too, nobody is left to take the ticket.
+        h.runs.push({ id: 'r2', status: 'failed', created_at: h.at(), failure_reason: 'runtime_offline' } as Run)
+        h.agents.find(agent => agent.id === 'a-ok-2')!.status = 'offline'
+        await h.push({ type: 'agent:status', payload: {} })
+        await h.executor.reconcile('t1')
+        expect(h.api.assignIssue).toHaveBeenCalledTimes(1)
+        expect(h.engine.report).toHaveBeenCalledWith('t1', expect.objectContaining({ question: expect.stringContaining('No Multica workstation') }))
+      })
+
+      it('cancels a retry Multica deferred for the old agent after the issue was reassigned', async () => {
+        const h = await launched()
+        h.runs.push({ id: 'r1', status: 'failed', created_at: h.at(), failure_reason: 'runtime_offline', agent_id: 'a-ok' } as Run)
+        await h.executor.reconcile('t1')
+        await relaunch(h)
+        h.runs.push({ id: 'r2', status: 'deferred', created_at: h.at(), agent_id: 'a-ok' } as Run,
+          { id: 'r3', status: 'queued', created_at: h.at(), agent_id: 'a-ok-2' } as Run)
+        await h.executor.reconcile('t1')
+        expect(h.api.cancelRun).toHaveBeenCalledWith('r2')
+        expect(h.api.cancelRun).not.toHaveBeenCalledWith('r3')
+        expect(h.engine.assignmentReassigned).toHaveBeenCalledTimes(1)
+      })
+
+      it('records a failure that is neither the workstation nor its login as the worker\'s, as before', async () => {
+        const h = await launched()
+        h.runs.push({ id: 'r1', status: 'failed', created_at: h.at(), error: 'tests failed', failure_reason: 'agent_error' } as Run)
+        // A tool's output is the worker's work, whatever it says.
+        h.messages.set('r1', [{ type: 'tool_result', output: 'bash: pnpm: command not found' }])
+        await h.executor.reconcile('t1')
+        expect(h.engine.assignmentReassigned).not.toHaveBeenCalled()
+        expect(h.engine.report).toHaveBeenCalledWith('t1', expect.objectContaining({ state: 'failed' }))
+        expect(h.engine.turnEnded).toHaveBeenCalled()
+      })
+
+      it('asks a person once when no other candidate is healthy, and moves the run once one comes online', async () => {
+        const h = await launched()
+        h.agents.find(agent => agent.id === 'a-ok-2')!.status = 'offline'
+        await h.push({ type: 'agent:status', payload: {} })
+        h.runs.push({ id: 'r1', status: 'queued', created_at: h.at() } as Run)
+        await h.executor.reconcile('t1')
+        await h.advance(6 * MINUTE)
+        await h.executor.reconcile('t1')
+        // The queued run stays: its own workstation may still come back and claim it.
+        expect(h.api.cancelRun).not.toHaveBeenCalled()
+        const asked = (h.engine.report.mock.calls as unknown as [string, { question?: string }][])
+          .filter(([, item]) => item.question?.includes('No Multica workstation'))
+        expect(asked).toHaveLength(1)
+        h.agents.find(agent => agent.id === 'a-ok-2')!.status = 'idle'
+        await h.push({ type: 'agent:status', payload: {} })
+        expect(h.api.cancelRun).toHaveBeenCalledWith('r1')
+        expect(h.api.assignIssue).toHaveBeenCalledWith('issue-1', 'a-ok-2')
+        expect(h.engine.report).toHaveBeenLastCalledWith('t1', expect.objectContaining({ question: null }))
+      })
+
+      it('refuses the late reports of the Assignment it moved away from', async () => {
+        const h = await launched()
+        const old = h.state()!.assignment!.nonce
+        h.runs.push({ id: 'r1', status: 'queued', created_at: h.at() } as Run)
+        await h.executor.reconcile('t1')
+        await h.advance(5 * MINUTE)
+        // The old worker reports before the new Assignment launches, and again after.
+        h.comments.push({ ...agentComment('k1', report({ tool: 'report', state: 'ready', summary: 'late' }, old)), author_id: 'a-ok' })
+        await h.executor.reconcile('t1')
+        await relaunch(h)
+        h.comments.push({ ...agentComment('k2', report({ tool: 'report', state: 'ready', summary: 'later' }, old)), author_id: 'a-ok' })
+        await h.executor.reconcile('t1')
+        expect(h.engine.report).not.toHaveBeenCalledWith('t1', expect.objectContaining({ state: 'ready' }))
+      })
+
+      it('never moves the ticket of a single MULTICA_AGENT_ID agent', async () => {
+        const h = setup(ticketWith([{ state: 'pending' }]))
+        await h.connect()
+        await h.launch()
+        h.setTicket(ticketWith([{}]))
+        h.runs.push({ id: 'r1', status: 'queued', created_at: h.at() } as Run)
+        await h.executor.reconcile('t1')
+        await h.advance(10 * MINUTE)
+        await h.executor.reconcile('t1')
+        expect(h.engine.assignmentReassigned).not.toHaveBeenCalled()
+      })
     })
 
     it('catches up on health when the event stream reconnects', async () => {

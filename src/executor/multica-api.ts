@@ -1,6 +1,6 @@
 /**
- * REST client for the Multica server, limited to what MulticaExecutor uses: issues with metadata and status, their runs and
- * comments (and the steer receipts of its timeline), cancelling a run, and the workspace's agents and runtimes. Every request carries the workspace as a query parameter, which the server requires.
+ * REST client for the Multica server, limited to what MulticaExecutor uses: issues with metadata, status and assignee, their
+ * runs, run messages and comments (and the steer receipts of its timeline), cancelling a run, and the workspace's agents and runtimes. Every request carries the workspace as a query parameter, which the server requires.
  */
 import { z } from 'zod'
 
@@ -16,7 +16,7 @@ export interface MulticaConnection {
 const RunSchema = z.object({
   id: z.string(), issue_id: z.string().nullish(), agent_id: z.string().nullish(), status: z.string(),
   attempt: z.number().nullish(), max_attempts: z.number().nullish(),
-  error: z.string().nullish(), can_supplement: z.boolean().nullish(), trigger_comment_id: z.string().nullish(),
+  error: z.string().nullish(), failure_reason: z.string().nullish(), created_at: z.string().nullish(), can_supplement: z.boolean().nullish(), trigger_comment_id: z.string().nullish(),
   delivered_comment_ids: z.array(z.string()).nullish(), started_at: z.string().nullish(), completed_at: z.string().nullish(),
   result: z.object({ output: z.string().nullish() }).passthrough().nullish(),
 }).passthrough()
@@ -41,6 +41,10 @@ const PostedCommentSchema = CommentSchema.extend({
     .passthrough()).nullish(),
   supplements: z.array(SteerReceiptSchema).nullish() })
 export type PostedComment = z.infer<typeof PostedCommentSchema>
+
+/** One message of a run, such as the agent's text, a tool call or an `error`. */
+const RunMessageSchema = z.object({ type: z.string(), content: z.string().nullish(), output: z.string().nullish() }).passthrough()
+export type RunMessage = z.infer<typeof RunMessageSchema>
 
 const AgentSchema = z.object({ id: z.string(), status: z.string(), runtime_id: z.string().nullish(), archived_at: z.string().nullish() })
   .passthrough()
@@ -84,6 +88,14 @@ export class MulticaApi {
   async setStatus(issueId: string, status: string, signal?: AbortSignal): Promise<void> {
     await this.request('PUT', `/api/issues/${encodeURIComponent(issueId)}`, z.unknown(), { status, suppress_run: true }, signal)
   }
+  /**
+   * Assigns an issue to another agent without the run the change would otherwise start; the comment that tells the agent
+   * its Assignment starts it. Multica cancels none of the issue's runs on a reassignment, so the caller does first.
+   */
+  async assignIssue(issueId: string, agentId: string, signal?: AbortSignal): Promise<void> {
+    await this.request('PUT', `/api/issues/${encodeURIComponent(issueId)}`, z.unknown(),
+      { assignee_type: 'agent', assignee_id: agentId, suppress_run: true }, signal)
+  }
   getIssue(issueId: string, signal?: AbortSignal): Promise<Issue> {
     return this.request('GET', `/api/issues/${encodeURIComponent(issueId)}`, IssueSchema, undefined, signal)
   }
@@ -110,6 +122,10 @@ export class MulticaApi {
   addComment(issueId: string, content: string, options: { parentId?: string; steer?: string[] } = {}, signal?: AbortSignal): Promise<PostedComment> {
     return this.request('POST', `/api/issues/${encodeURIComponent(issueId)}/comments`, PostedCommentSchema,
       { content, ...options.parentId ? { parent_id: options.parentId } : {}, ...options.steer?.length ? { steer_task_ids: options.steer } : {} }, signal)
+  }
+  /** A run's messages, oldest first: what `multica issue run-messages` prints. */
+  runMessages(runId: string, signal?: AbortSignal): Promise<RunMessage[]> {
+    return this.request('GET', `/api/tasks/${encodeURIComponent(runId)}/messages`, z.array(RunMessageSchema), undefined, signal)
   }
   async cancelRun(runId: string, signal?: AbortSignal): Promise<void> {
     await this.request('POST', `/api/tasks/${encodeURIComponent(runId)}/cancel`, z.unknown(), {}, signal)

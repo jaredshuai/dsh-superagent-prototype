@@ -246,7 +246,7 @@ daemon_id 是机器级的，存在 `~/.multica/daemon.id`，CLI daemon 与桌面
 - 多候选（`MULTICA_AGENT_IDS`）：候选健康 = agent 存在、未归档、`status` 不是 `offline`，且它绑定的 runtime `status = online`。
   健康快照来自 REST `GET /api/agents` 与 `GET /api/runtimes`，只在事件流每次（重）连接时、以及收到 `agent:` / `runtime:` / `daemon:`
   事件（`daemon:heartbeat*` 除外）时取一次（同一时刻多个请求合并成一次），不做周期轮询（ADR 0002）。快照到手之前不派新 Ticket。
-  只有**新 Ticket**（还没有 issue 的）按健康挑选；已有 issue 的后续 Assignment 仍发到该 issue 已指派的 agent（换 agent 属于改派，见「还没做」）。
+  只有**新 Ticket**（还没有 issue 的）按健康挑选；已有 issue 的后续 Assignment 仍发到该 issue 已指派的 agent，换 agent 只经改派（见下「跨工作站改派」）。
   issue 指派给哪个 agent 记在 Ticket 状态的 `agentId` 里，回报作者校验与 `trigger_outcomes` 检查都以它为准。
 - 全部候选不健康：Ticket 的 Assignment 停在 pending（不建 issue），Executor 以 `progress` 回报挂一个待人工决定
   （「No Multica workstation is online to run this ticket…」），每个 Assignment 只问一次（记在 `multica-waiting:<ticket>`，重连、重启都不重复）。
@@ -258,12 +258,33 @@ daemon_id 是机器级的，存在 `~/.multica/daemon.id`，CLI daemon 与桌面
   - 全程 agent 的 `status` 一直是 `idle`，不会变成 `offline`：健康必须看 runtime 状态，不能只看 agent。
   - 稳态下（90 s 探针）没有任何此类事件。所以「收到 `daemon:` 事件就重取快照」正好覆盖掉线与恢复，事件不带 id 也无妨。
   同理，取快照的 REST 请求失败时不重试（不轮询），记在 `worker` 健康项里，等下一个此类事件或重连再取。
+- 跨工作站改派（#8，ADR 0004，`multica-failover.ts`）：只在多候选（`MULTICA_AGENT_IDS`）下做，单个 `MULTICA_AGENT_ID` 从不改派。每次对账判断 issue 是否要换 agent：
+  - issue 的 run `queued` 未被认领超过 **5 分钟**（从 run 的 `created_at` 算）；不到 5 分钟时挂一个到点的计时器，到点再对账一次（只为这一个时刻，不轮询）。
+    2–3 分钟的同机 daemon 切换空窗不会触发。只要有 run 是 `running` / `dispatched`（被认领了），就不改派，并撤掉待做的改派与挂着的问题。
+  - 这个 Assignment 的 run 以 `runtime_offline` / `runtime_recovery` / `runtime_reconnect_timeout` / `timeout` / `queued_expired` 失败 ⇒ 改派
+    （Multica 对 `runtime_offline` 会在原 runtime 上生成 `deferred` 重试，改派前一并取消）；不记为 Worker 的 `failed`，也不记 `turnEnded`。
+  - 不可重试的失败 ⇒ 立即改派，并把原候选在本实例内暂停 30 分钟（`suspend`，健康也不选）。判据是 `failure_reason`（`agent_error.provider_auth_or_access`、
+    `…missing_config`、`runtime_access_denied` 等），以及——Multica 常只记一个笼统的 `agent_error`——run 消息（`GET /api/tasks/<id>/messages`）：
+    只看 `error` 类消息（工具输出等属于 Worker 的工作，不看），匹配 `not logged in`、`login required`、`unauthorized`、`invalid api key`、`command not found` 等。其余失败照旧记为 Worker 的 `failed`。
+  - 改派顺序：先取消 issue 的活跃 run，再 `PUT /api/issues/<id>` 改指派（`assignee_type: agent`、`suppress_run: true`；Multica 改指派不取消已有 run，所以必须先取消），
+    然后在同一事务里清掉 Ticket 状态里的 `assignment`、把 `agentId` 换成新 agent（旧 agent 已有的评论记为 seen），并由 Engine 的 `assignmentReassigned` 以 `reassigned` 结束旧 Assignment、开新 Assignment
+    （先收到一条说明改派原因、要求先拉分支读评论的 Input）。新 Assignment 照常启动：在**同一个 issue** 上发 `laterAssignmentComment`（注明从别的工作站移来），
+    评论起新 agent 的 run。issue 不变，`superagent_ticket` metadata 照样反查到 Ticket。
+  - 旧 Assignment 的回报一律拒收：旧 agent 的评论不再读（作者校验以 `agentId` 为准），新 Assignment 换了 nonce。先取消后改派；之后每次对账还会取消
+    issue 上不属于当前 agent 的活跃 run（如改派后 Multica 才为旧 agent 生成的 `deferred` 重试，run 带 `agent_id`），所以不会有两个活跃 run。
+  - 没有其他健康候选：issue 不动（排队的 run 留着，原工作站回来仍可认领），按 #4 的「全部离线」行为问人一次（「…none of the other candidate Multica agents…」，
+    记在 `multica-waiting:<ticket>`）。任一候选恢复健康后重新对账，改派成功即以 `question: null` 撤下问题。
+  - 改派的决定在第一步之前存进状态 `reassigning`（带它针对的 Assignment，人重试后的新 Assignment 不沿用）；取消或改指派失败、或中途崩溃时
+    记在 `worker` 健康项，下次对账（事件、计时器或重连后的补齐）再做。
+  - 已知局限：未认领时长用服务端的 `created_at` 对本机时钟，两边时钟偏差会让阈值早到或晚到；健康 agent 因并发已满让 run 排队超过 5 分钟也会被改派；
+    因不可重试的失败被暂停的原候选，暂停到期后不会自动重新考虑（只找“其他”候选），若其他候选一直不在线，Ticket 停在问人那一步，靠人重试。
+  - 待做：真实环境演练（让一台工作站离线，看改派到另一台），结论补在这里。
 - 重启：远端 run 不受影响，所以 `resume` 不打断 running 的 Assignment，只重新排队 pending 的启动；连接建立后的补齐会追上错过的事件。
 
 **还没做**：
 
 1. ~~回报被拒只记在 `worker` 健康项里~~：已做，见上「回报被拒的反馈」与第 8.1 节。
-2. ~~多候选 agent~~：已做，见上「多候选」。跨机故障转移与改派（第 4 节第 2、2b 层）还没做（#8）。
+2. ~~多候选 agent~~：已做，见上「多候选」。~~跨机故障转移与改派（第 4 节第 2、2b 层）~~：已做，见上「跨工作站改派」（#8）；真实环境演练还没做。
 3. ~~线上端到端联调~~：GitHub 与飞书私聊入口都已跑通到 PR 合并、Ticket 结束，见第 8.2 节。
 4. 第 7 节第 6 项（MCP 注入）。第 5 项（各 runtime 对协议的遵从度）已评估（#7，第 8.4 节），steer 投递路径已在线上实测（#6，第 8.3 节）。
 5. ~~Ticket 结束时关闭 issue~~：已做（#9），见上「Ticket 结束时关闭 issue」。

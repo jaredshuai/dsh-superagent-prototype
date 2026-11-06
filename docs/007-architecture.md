@@ -353,8 +353,9 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/app/views/overview.ts` | The overview: Tickets that need a person, problems, the last day's flow and the Executor's load |
 | `src/executor/dsh.ts` | The DshExecutor, `WorkerSlots`, `ticketExecution`, `inputMessage` and `mandateInstructions` |
 | `src/executor/multica.ts` | The MulticaExecutor, selected with `SUPERAGENT_EXECUTOR=multica`: Assignments as Multica issues run on the operator's machines (see 009 MulticaExecutor), and `multicaConfigFromEnv` |
-| `src/executor/multica-api.ts` | `MulticaApi`, the REST calls the MulticaExecutor makes: issues, their metadata and status, runs, comments, cancelling a run, the workspace's agents and runtimes |
-| `src/executor/multica-candidates.ts` | `MulticaCandidates`, which configured candidate Multica agent can take a new ticket, from a snapshot of the workspace's agents and runtimes |
+| `src/executor/multica-api.ts` | `MulticaApi`, the REST calls the MulticaExecutor makes: issues, their metadata, status and assignee, runs and their messages, comments, cancelling a run, the workspace's agents and runtimes |
+| `src/executor/multica-candidates.ts` | `MulticaCandidates`, which configured candidate Multica agent can take a new ticket or a reassigned issue, from a snapshot of the workspace's agents and runtimes, with candidates kept out for a while after a failure they would repeat |
+| `src/executor/multica-failover.ts` | When a ticket's issue is reassigned to another candidate: the unclaimed-run limit, and which failed runs move (workstation gone, or a failure it would repeat, read from the run's messages) |
 | `src/executor/multica-events.ts` | `MulticaEvents`, the Multica workspace event stream over WebSocket, with reconnection and a catch-up call on every connection |
 | `src/executor/multica-protocol.ts` | The comment protocol with remote workers: the issue description, Input comments, `superagent-report` blocks and `planDelivery` |
 | `scripts/multica-eval/run.ts`, `score.ts` | The runtime protocol evaluation (#7, 009 §8.4): runs the same tasks on Multica agents of several runtimes with the executor's protocol code, and `scoreCase`, which scores each case from its comments, runs and run messages |

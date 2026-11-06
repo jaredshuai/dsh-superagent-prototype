@@ -598,6 +598,7 @@ const TEXT = {
   'reason.channelGone': ['对话已无法接收消息', 'The conversation can no longer receive messages'],
   'reason.channelIgnored': ['来源已不再监听这个对话', 'The Source no longer listens to this conversation'],
   'reason.hostRestarted': ['dsh-superagent 重启', 'dsh-superagent restarted'],
+  'reason.reassigned': ['改派给另一个执行者', 'Moved to another worker'],
   'reason.retried': ['人工重试', 'Retried by a person'],
   'reason.completed': ['已完成', 'Completed'],
   'reason.dropped': ['无需处理，已关闭', 'No action needed; closed'],

@@ -17,6 +17,7 @@ export const REASONS = {
   senderNotMember: 'The sender is not on the Source\'s list',
   retried: 'Retried by a person',
   hostRestarted: 'dsh-superagent restarted',
+  reassigned: 'Moved to another worker',
   stopUnknown: 'Stop target is unknown or already ended',
   stopNotExplicit: 'A stop needs an explicit request from a sender on the list',
   directionUnsettled: 'Implementation intent or target direction is not established, or a product/design decision is still required',
