@@ -234,6 +234,15 @@ daemon_id 是机器级的，存在 `~/.multica/daemon.id`，CLI daemon 与桌面
   待发的反馈存在 `refusals` 里，发成功才移除，发失败下次对账再发；发之前先看 issue 上是否已有同一条评论下、同一块编号的反馈，
   有就不再发——所以重连补齐、执行器在「已发出但未存盘」时重启，都不会重复回复。别人（不是配置的 agent）的评论从不解析，也就不回复。
   issue 描述里告诉 Worker：发完回报后列一下评论，看到点名自己那块的 `/note superagent:` 回复就改正后重发。
+  回报常是 run 的最后一步，`/note` 又不起 run，所以（#13）执行器记下当前 Assignment **最后一个可能是回报、之后没有被接受的 `report` 的被拒块**
+  （`unanswered`；被拒的 `report`，或解析不了、看不出是什么的块；被拒的 `ack` / `handback` / `follow` / `unrelated` 只回 `/note`）。
+  issue 上没有活跃或排队的 run、没有待投递或已投递未读的 Input（它们自己会起 run，run 里能看到 `/note`）时，把拒收说明作为一条**普通评论**
+  （`superagent: report block N in comment <id> was refused: …`，同样不含 nonce，`refusalResend`）回复在那条评论下，起一个 run 让 Worker 改正。
+  补发成功时这次 run 结束**不记 `turnEnded`**，Ticket 不先掉进等待，由补发起的 run 结束这个 turn；补发失败照常记 `turnEnded`，下次对账再补。
+  每个 Assignment 最多补发一次（`resentFor`），之后再被拒只回 `/note`、run 结束照常算等待，不会循环；同一条评论下已有 `superagent: report block`
+  开头的回复就不再发（重启安全）。同一 run 内已改正的（之后有被接受的 `report`）不补发；已补发过、或换了 Assignment 的 `unanswered` 直接丢弃。
+  这项改动上线前就被拒、已记为 seen 的评论没有 `unanswered`，不会补发，仍只靠 run 结束记为等待。
+- `ack`（#14）：issue 描述「How to report」第一条要求每个 run 在任何其他步骤之前，为每条还没确认的触发消息先发一个 `ack`，快活也要发。
 - 多候选（`MULTICA_AGENT_IDS`）：候选健康 = agent 存在、未归档、`status` 不是 `offline`，且它绑定的 runtime `status = online`。
   健康快照来自 REST `GET /api/agents` 与 `GET /api/runtimes`，只在事件流每次（重）连接时、以及收到 `agent:` / `runtime:` / `daemon:`
   事件（`daemon:heartbeat*` 除外）时取一次（同一时刻多个请求合并成一次），不做周期轮询（ADR 0002）。快照到手之前不派新 Ticket。
@@ -407,7 +416,7 @@ PR #8 的作者与提交作者都是 `jaredwtt1203`。
 
 ## 8.4 各 runtime 对回报协议的遵从度（#7）
 
-**做法**：`scripts/multica-eval/run.ts` 扮演 MulticaExecutor，直接用执行器的协议代码（`issueDescription` / `parseReports` / `refusalNote` / `inputComment` / `planDelivery`）
+**做法**：`scripts/multica-eval/run.ts` 扮演 MulticaExecutor，直接用执行器的协议代码（`issueDescription` / `parseReports` / `refusalNote` / `refusalResend` / `inputComment` / `planDelivery`）
 在 Multica 建 issue、校验回报块、回复 `/note superagent:` 拒收、投递后续消息；`score.ts` 的 `scoreCase` 从 issue 的评论、run 与 run 消息算出各项指标（`tests/multica-eval.spec.ts`）。
 没走线上服务器全链路：被评估的是 Worker 一侧，而 Worker 看到的描述、评论与执行器发的逐字相同；换 runtime 不必改服务器配置、重启服务。
 差别：脚本 3 s 轮询，执行器靠 WebSocket 推送，所以脚本的拒收回复比执行器慢 1–3 s（见下「拒收后纠正」）。
@@ -460,11 +469,35 @@ PR #8 的作者与提交作者都是 `jaredwtt1203`。
 
 **派工建议**（`MULTICA_AGENT_IDS` 的顺序）：
 
-1. **Claude 放第一**：协议遵从最完整（steer、提问，最常发 `ack`），最适合会追加消息、要来回问答的 Ticket；缺点是被拒的最终回报不会自己改正（#13 改描述后复测）。
+1. **Claude 放第一**：协议遵从最完整（steer、提问，最常发 `ack`），最适合会追加消息、要来回问答的 Ticket；被拒的最终回报不会自己改正，#13 之后由执行器补发兜住（见下「复测」）。
 2. **codebuddy 第二**：最快的非 steer runtime，每个 run 都回报、被拒会改正，适合小改动开 PR 这类一轮能完成的 Ticket；免费模型，可作默认的低成本备份。
 3. **opencode 第三**：遵从度与 codebuddy 相当但慢 2–4 倍，且有免费额度用完的前科（第 8.2 节），只作备份。
-4. **codex 暂不放进候选**：pr 一项可用但不发 `ack`、被拒不改正，其余两项因本机 provider 故障无结果（#15）。
+4. **codex 第四**（复测后改）：provider 恢复后三项都通过，能 steer、被拒在同一 run 内改正，但最慢（单个 run 2–7 min），`ack` 仍只 1/3 先发，
+   且依赖本机自定义 provider（这次评估里停过一次）；排在 opencode 之后作最后的备份。
 
 **后续**：协议说明的调整提为 #13（要求 Worker 发完回报后稍等再看拒收回复，或执行器在 run 已结束时把拒收作为能起 run 的消息投递）、
 #14（描述里明确要求先发 `ack`，否则执行器不再依赖它）；codex 重测为 #15。评估留下的 issue（JAR-57–70）已用 `--no-start` 改为 `done` / `cancelled`，sandbox 上的 PR #11–15 已关闭、`agent/eval-*` 分支已删除；
 新建的 `superagent-worker-jxccs-codex` / `-opencode` 两个 agent 保留，供 #15 与后续复测使用。
+
+### 复测（#13、#14、#15，2026-11-06 05:26–05:45 UTC）
+
+改动：执行器在 run 结束后把仍未改正的被拒回报补发成能起 run 的普通评论（#13，见第 8 节「回报被拒的反馈」；脚本按同样规则补发），
+描述「How to report」第一条要求在任何其他步骤之前先发 `ack`（#14）。codex 的 provider 已恢复（`codex exec` 能回答），三项重跑（#15）。
+claude 只跑 pr，codebuddy、opencode 跑 pr 与 question，codex 跑全部三项；8 个用例全部完成，无超时。
+
+| | claude | codebuddy | opencode | codex |
+| --- | --- | --- | --- | --- |
+| Issue | JAR-73（pr） | JAR-71 / 75（pr / question） | JAR-72 / 76 | JAR-74 / 77 / 78（pr / question / steer） |
+| 先发 `ack` | 1/1 | 2/2 | 2/2 | 1/3（只有 question；pr、steer 都没发） |
+| 被故意拒收后 | run 已结束 → 8 s 后补发 → 新 run（12 s）只重发回报，改正 | 同 claude（新 run 23 s） | 同一 run 内改正 | 同一 run 内改正（上次没再看评论） |
+| 重复步骤 / checkout | PR 1 个；补发起的 run 不碰 git | 同左；question 的后续 run 复用目录 | PR 1 个；question 的后续 run 只核对 | PR 1 个；question、steer 的消息都 steer 进同一 run（回执 `delivered`） |
+| 提问 | — | `blocked` | `blocked` | `blocked` |
+| run 耗时 | 43 + 12 s | pr 61 + 23 s，question 51 + 47 s | pr 218 s，question 200 + 96 s | pr 398 s，question 138 s，steer 410 s |
+
+- **#13 生效**：Claude 与这次的 codebuddy 都在被拒后立即结束了 run，补发起的短 run 里只重发改正后的回报，没有重做 commit / PR；
+  opencode、codex 在同一 run 内改正，不触发补发。被拒的最终回报这次 4/4 得到改正（上次 2/4）。
+- **#14 大幅改善**：先发 `ack` 从 12 个有效用例里 2 个，变为 8 个里 6 个；codebuddy、opencode 全部先发（上次 1/3、0/3）。codex 仍有 2 次不发，
+  执行器不依赖 `ack`（缺了只少一条确认回复，不影响 Ticket 状态），所以不加兜底。
+- 每个 runtime 每项仍只跑了一次，结论的局限同上。
+
+清理：JAR-71–78 已用 `--no-start` 改为 `done`，sandbox PR #16–19 已关闭、这次的 `agent/eval-*` 分支已删除。

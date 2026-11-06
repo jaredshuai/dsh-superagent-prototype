@@ -526,6 +526,82 @@ describe('MulticaExecutor', () => {
       expect(notes(h)).toHaveLength(1)
     })
 
+    const retries = (h: ReturnType<typeof setup>) => h.posted.filter(item => item.content.startsWith('superagent: '))
+
+    it('posts a refusal again as a plain comment once the run ended with no report accepted after it, once per assignment', async () => {
+      const { h } = await running()
+      h.comments.push(agentComment('k1', report({ tool: 'report', state: 'ready', summary: 'x' }, 'guess')))
+      await h.executor.reconcile('t1')
+      expect(notes(h)).toHaveLength(1)
+      // The run may still fix it.
+      expect(retries(h)).toEqual([])
+      h.runs[0]!.status = 'completed'
+      await h.executor.reconcile('t1')
+      expect(retries(h)).toHaveLength(1)
+      expect(retries(h)[0]).toMatchObject({ parentId: 'k1' })
+      expect(retries(h)[0]!.content).toContain('report block 1 in comment k1 was refused: wrong nonce')
+      // The run it starts ends the turn, so the ticket does not wait in between.
+      expect(h.engine.turnEnded).not.toHaveBeenCalled()
+      await h.executor.reconcile('t1')
+      // The run it started refuses again: the worker had its second chance, and the run's end counts as waiting.
+      h.runs.push({ id: 'r2', status: 'completed' })
+      h.comments.push(agentComment('k2', report({ tool: 'report', state: 'ready', summary: 'x' }, 'guess')))
+      await h.executor.reconcile('t1')
+      expect(notes(h)).toHaveLength(2)
+      expect(retries(h)).toHaveLength(1)
+      expect(h.engine.turnEnded).toHaveBeenCalledWith('t1', 'a1')
+      expect(h.state()!.unanswered).toBeUndefined()
+    })
+
+    it('does not post a refusal again that is on the issue already, as after a restart', async () => {
+      const { h } = await running()
+      h.comments.push(agentComment('k1', report({ tool: 'report', state: 'ready', summary: 'x' }, 'guess')))
+      await h.executor.reconcile('t1')
+      h.runs[0]!.status = 'completed'
+      await h.executor.reconcile('t1')
+      expect(retries(h)).toHaveLength(1)
+      // A crash after the comment went out but before the state was saved.
+      const { resentFor: _, ...lost } = h.state()!
+      h.setState({ ...lost, unanswered: { assignmentId: 'a1', commentId: 'k1', resend: 'superagent: report block 1 in comment k1 was refused: wrong nonce.' } })
+      h.restart()
+      await h.executor.reconcile('t1')
+      expect(retries(h)).toHaveLength(1)
+    })
+
+    it('leaves a refused ack to the note, and a refusal to the run that reads a delivery not read yet', async () => {
+      const { h } = await running()
+      h.engine.reply.mockImplementationOnce(() => { throw new Error('No such trigger') })
+      h.comments.push(agentComment('k1', report({ tool: 'ack', trigger_id: 'made-up', text: 'on it' }, h.state()!.assignment!.nonce)))
+      h.runs[0]!.status = 'completed'
+      await h.executor.reconcile('t1')
+      expect(notes(h)).toHaveLength(1)
+      expect(retries(h)).toEqual([])
+      const other = await running()
+      other.h.comments.push(agentComment('k1', report({ tool: 'report', state: 'ready', summary: 'x' }, 'guess')))
+      other.h.setState({ ...other.h.state()!, deliveries: [{ commentId: 'd1', inputIds: ['i1'], assignmentId: 'a1' }] })
+      other.h.runs[0]!.status = 'completed'
+      await other.h.executor.reconcile('t1')
+      expect(retries(other.h)).toEqual([])
+    })
+
+    it('does not post a refusal again when a later report was accepted, or while a run waits to start', async () => {
+      const { h, nonce } = await running()
+      h.comments.push(agentComment('k1', report({ tool: 'report', state: 'ready', summary: 'x' }, 'guess')),
+        agentComment('k2', report({ tool: 'report', state: 'ready', summary: 'fixed' }, nonce)))
+      h.runs[0]!.status = 'completed'
+      await h.executor.reconcile('t1')
+      expect(retries(h)).toEqual([])
+      const other = await running()
+      other.h.comments.push(agentComment('k1', report({ tool: 'report', state: 'ready', summary: 'x' }, 'guess')))
+      other.h.runs[0]!.status = 'completed'
+      other.h.runs.push({ id: 'r2', status: 'queued' })
+      await other.h.executor.reconcile('t1')
+      expect(retries(other.h)).toEqual([])
+      other.h.runs[1]!.status = 'completed'
+      await other.h.executor.reconcile('t1')
+      expect(retries(other.h)).toHaveLength(1)
+    })
+
     it('does not answer report blocks in comments the configured agent did not write', async () => {
       const { h } = await running()
       h.comments.push({ ...agentComment('k1', report({ tool: 'report', state: 'ready', summary: 'x' }, 'guess')), author_id: 'other-agent' },

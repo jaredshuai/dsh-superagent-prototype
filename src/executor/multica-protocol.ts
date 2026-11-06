@@ -57,12 +57,26 @@ export function parseReports(content: string, expected: { assignment: string; no
 export const REFUSAL_PREFIX = '/note superagent:'
 const blockLabel = (index: number) => `report block ${index + 1}`
 
+/** Why a block was refused, as a worker reads it: the nonce never appears. */
+const refusedBecause = (reason: string, nonce: string) => `was refused: ${nonce ? reason.split(nonce).join('<nonce>') : reason}. Nothing in it was recorded.`
+
 /** The reply under a worker's comment that says why its `index`th report block was refused; the nonce never appears in it. */
 export function refusalNote(index: number, reason: string, nonce: string): string {
-  const said = nonce ? reason.split(nonce).join('<nonce>') : reason
-  return `${REFUSAL_PREFIX} ${blockLabel(index)} in this comment was refused: ${said}. `
-    + 'Nothing in it was recorded. Fix it and post the report again in a new comment, as the issue description says.'
+  return `${REFUSAL_PREFIX} ${blockLabel(index)} in this comment ${refusedBecause(reason, nonce)} `
+    + 'Fix it and post the report again in a new comment, as the issue description says.'
 }
+/**
+ * The refusal of a worker's last word, posted again once its run ended with no report accepted after it: a plain comment,
+ * so unlike the note it starts a run, and the refused report is not left standing. The nonce never appears in it.
+ */
+export function refusalResend(index: number, reason: string, nonce: string, commentId: string): string {
+  return `${RESEND_PREFIX} ${blockLabel(index)} in comment ${commentId} ${refusedBecause(reason, nonce)} `
+    + 'Your run ended before you fixed it: fix it and post the report again in a new comment, as the issue description says.'
+}
+/** The prefix of `refusalResend`: no `/note`, so the comment starts a run. */
+export const RESEND_PREFIX = 'superagent:'
+/** Whether a comment is a refusal posted again by `refusalResend`, which needs no second copy under the same comment. */
+export const isRefusalResend = (content: string): boolean => content.startsWith(`${RESEND_PREFIX} report block `)
 /** Whether a comment is the refusal note for the `index`th report block of the comment it replies to. */
 export function isRefusalNote(content: string, index: number): boolean {
   return content.startsWith(`${REFUSAL_PREFIX} ${blockLabel(index)} `)
@@ -103,9 +117,11 @@ export function issueDescription(brief: Brief): string {
     '',
     '## How to report',
     '',
+    '- Before any other step of a run, post an `ack` for each trigger you have not acknowledged yet, in one sentence that says what you will do. Do it even when the work looks quick.',
+    '',
     'Report by posting a comment on this issue with the multica CLI (`multica issue comment add <issue> --content-stdin`; reply under the comment that started your run with `--parent` when one did). The comment must contain one fenced block like these; anything else in the comment is ignored:',
     '',
-    example(brief, { tool: 'ack', trigger_id: '<trigger_id>', text: 'One sentence acknowledging the request before substantial work.' }),
+    example(brief, { tool: 'ack', trigger_id: '<trigger_id>', text: 'One sentence acknowledging the request, posted before any other step.' }),
     '',
     example(brief, { tool: 'report', state: 'ready', summary: 'What was done.', pr_number: 12 }),
     '',

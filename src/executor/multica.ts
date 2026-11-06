@@ -21,8 +21,8 @@ import type { Comment, MulticaApi, Run } from './multica-api.ts'
 import { MulticaCandidates } from './multica-candidates.ts'
 import { MulticaEvents, type MulticaEvent, type SocketFactory } from './multica-events.ts'
 import type { MulticaConnection } from './multica-api.ts'
-import { ENDED_STATUSES, WAITING_STATUSES, inputComment, isRefusalNote, issueDescription, newNonce, parseReports, planDelivery,
-  laterAssignmentComment, refusalNote, refusedOutcome, type Brief, type ReportBlock } from './multica-protocol.ts'
+import { ENDED_STATUSES, WAITING_STATUSES, inputComment, isRefusalNote, isRefusalResend, issueDescription, newNonce, parseReports, planDelivery,
+  laterAssignmentComment, refusalNote, refusalResend, refusedOutcome, type Brief, type ReportBlock } from './multica-protocol.ts'
 
 /** Which agents run the tickets, and what every worker is told about where to work. */
 export interface MulticaExecutorConfig extends MulticaConnection {
@@ -78,6 +78,13 @@ export interface MulticaTicketState {
   cancelled?: string[]
   /** Refused report blocks whose note to the worker has not reached Multica yet. */
   refusals?: Refusal[]
+  /**
+   * The current Assignment's last refused block that may have been its report (a refused `report`, or one that did not
+   * parse) with no report accepted after it, which is told again once its run ended; dropped once told or superseded.
+   */
+  unanswered?: Unanswered
+  /** The Assignment whose refusal was posted again as a plain comment: at most one such comment, and run, per Assignment. */
+  resentFor?: string
   /** The status the issue was closed with when its ticket ended; a woken ticket reopens it. */
   closed?: IssueEnd
 }
@@ -89,6 +96,8 @@ export interface Delivery {
 }
 /** A refused report block: the `index`th block of an agent comment, and the note that tells its worker why. */
 export interface Refusal { commentId: string; index: number; note: string }
+/** A refused report block still standing, and the plain comment that tells its worker again: `refusalResend`. */
+export interface Unanswered { assignmentId: string; commentId: string; resend: string }
 export const MULTICA_KV = {
   ticket: family<MulticaTicketState>('multica-ticket:'),
   issue: family<string>('multica-issue:'),
@@ -455,7 +464,12 @@ export class MulticaExecutor implements Executor {
     const fresh = comments.filter(comment => comment.author_type === 'agent' && comment.author_id === this.agentOf(state)
       && !state.seen.includes(comment.id)).sort((a, b) => a.created_at.localeCompare(b.created_at))
     const refused: Refusal[] = []
-    for (const comment of fresh) refused.push(...await this.apply(ticketId, state, comment))
+    let unanswered = state.unanswered
+    for (const comment of fresh) {
+      const applied = await this.apply(ticketId, state, comment)
+      refused.push(...applied.refused)
+      if (applied.last) unanswered = applied.last === 'accepted' ? undefined : applied.last
+    }
     // A run first seen already ended started and ended between two reconciliations, such as while the stream was down.
     const ended = runs.filter(run => ENDED_STATUSES.has(run.status) && !ENDED_STATUSES.has(state.runs[run.id] ?? ''))
     const fresher = this.state(ticketId) ?? state
@@ -467,19 +481,26 @@ export class MulticaExecutor implements Executor {
       return took ? { ...delivery, read: true } : delivery
     })
     const statuses = Object.fromEntries(runs.map(run => [run.id, run.status]))
-    this.save(ticketId, { ...fresher, deliveries: deliveries.slice(-HISTORY_LIMIT), seen: [...fresher.seen, ...fresh.map(comment => comment.id)].slice(-SEEN_LIMIT),
-      runs: statuses, refusals: [...fresher.refusals ?? [], ...refused].slice(-HISTORY_LIMIT) })
+    const { unanswered: _, ...kept } = fresher
+    // One told already, or one of an Assignment that no longer reports here, stays unanswered for good.
+    if (unanswered && (unanswered.assignmentId !== fresher.assignment?.id || fresher.resentFor === unanswered.assignmentId)) unanswered = undefined
+    this.save(ticketId, { ...kept, deliveries: deliveries.slice(-HISTORY_LIMIT), seen: [...fresher.seen, ...fresh.map(comment => comment.id)].slice(-SEEN_LIMIT),
+      runs: statuses, refusals: [...fresher.refusals ?? [], ...refused].slice(-HISTORY_LIMIT), ...unanswered ? { unanswered } : {} })
     await this.answerRefusals(ticketId, comments)
     if (this.state(ticketId)?.deliveries.some(delivery => delivery.steeredRun)) await this.deliverQueued(ticketId, () => this.settleSteers(ticketId, comments))
     const live = this.host.store.tickets.get(ticketId)
     const assignment = live && liveTicket(live) ? runningAssignment(live) : undefined
     if (!assignment) return
     const active = runs.some(run => !ENDED_STATUSES.has(run.status))
+    // Inputs waiting, or delivered and not read yet (such as a steer just posted again), start a run of their own, which
+    // reads the refusal note in the comment history. A refusal posted again starts the run that ends this turn instead.
+    const unread = live!.undelivered.length > 0 || !!this.state(ticketId)?.deliveries.some(delivery => !delivery.read && delivery.assignmentId === assignment.id)
+    const resent = !active && !unread && await this.resendRefusal(ticketId, assignment.id, comments)
     const ours = ended.filter(run => !(fresher.cancelled ?? []).includes(run.id))
     if (!active && ours.length) {
       const last = ours.sort((a, b) => (a.completed_at ?? '').localeCompare(b.completed_at ?? '')).at(-1)!
       if (last.status === 'failed') this.reportFailed(ticketId, this.runFailure(last))
-      this.host.engine.turnEnded(ticketId, assignment.id)
+      if (!resent) this.host.engine.turnEnded(ticketId, assignment.id)
     }
     // A delivery Multica refused waits for the next Input or a retry; delivering it again here would post it on every event.
     if (live!.undelivered.length && !live!.delivery && !runs.some(run => WAITING_STATUSES.has(run.status))) this.deliver(live!, assignment)
@@ -568,22 +589,59 @@ export class MulticaExecutor implements Executor {
     } catch (error) { this.failure(`Recording a ${report.state} report`, error) }
   }
 
-  /** Applies the report blocks of one agent comment for the ticket's current Assignment; returns the blocks it refused. */
-  private async apply(ticketId: string, state: MulticaTicketState, comment: Comment): Promise<Refusal[]> {
+  /**
+   * Applies the report blocks of one agent comment for the ticket's current Assignment; returns the blocks it refused, and
+   * whether the comment ends with a refused block or an accepted report, which decides whether a refusal still stands.
+   */
+  private async apply(ticketId: string, state: MulticaTicketState, comment: Comment): Promise<{ refused: Refusal[]; last?: 'accepted' | Unanswered }> {
     const assignment = state.assignment
-    if (!assignment) return []
+    if (!assignment) return { refused: [] }
     const refused: Refusal[] = []
-    const refuse = (index: number, reason: string) => {
+    let last: 'accepted' | Unanswered | undefined
+    /** Refuses a block; one that may have been the report, as one that did not parse may, stands until a report is accepted. */
+    const refuse = (index: number, reason: string, report: boolean) => {
       refused.push({ commentId: comment.id, index, note: refusalNote(index, reason, assignment.nonce) })
+      if (report) last = { assignmentId: assignment.id, commentId: comment.id, resend: refusalResend(index, reason, assignment.nonce, comment.id) }
     }
     for (const [index, parsed] of parseReports(comment.content, { assignment: assignment.id, nonce: assignment.nonce }).entries()) {
-      if (!parsed.ok) { this.failure(`Ignored a report block in comment ${comment.id}`, parsed.error); refuse(index, parsed.error); continue }
-      try { await this.request(ticketId, parsed.block) } catch (error) {
+      if (!parsed.ok) { this.failure(`Ignored a report block in comment ${comment.id}`, parsed.error); refuse(index, parsed.error, true); continue }
+      try {
+        await this.request(ticketId, parsed.block)
+        if (parsed.block.tool === 'report') last = 'accepted'
+      } catch (error) {
         this.failure(`Report block in comment ${comment.id}`, error)
-        refuse(index, errorText(error))
+        refuse(index, errorText(error), parsed.block.tool === 'report')
       }
     }
-    return refused
+    return { refused, ...last ? { last } : {} }
+  }
+  /**
+   * Tells the worker again, with a plain comment that starts a run, about a refused report block its run ended without
+   * fixing: a worker's report is often its last step, and the `/note` reply starts no run. Once per Assignment, so a worker
+   * that keeps sending refused blocks costs one extra run, not a loop; one already on the issue, such as one posted just
+   * before a restart, is not posted again. Returns whether a run is to start from it.
+   */
+  private async resendRefusal(ticketId: string, assignmentId: string, comments: readonly Comment[]): Promise<boolean> {
+    const state = this.state(ticketId)
+    const unanswered = state?.unanswered
+    if (!state || unanswered?.assignmentId !== assignmentId || state.resentFor === assignmentId) return false
+    const done = () => {
+      const { unanswered: _, ...rest } = this.state(ticketId) ?? state
+      this.save(ticketId, { ...rest, resentFor: assignmentId })
+    }
+    if (comments.some(comment => comment.parent_id === unanswered.commentId && isRefusalResend(comment.content))) { done(); return true }
+    const what = `Telling the worker again about the refused report in comment ${unanswered.commentId}`
+    try {
+      const posted = await this.host.api.addComment(state.issueId, unanswered.resend, { parentId: unanswered.commentId })
+      const refused = refusedOutcome(posted.trigger_outcomes ?? undefined, this.agentOf(state))
+      if (refused) this.failure(what, `Multica started no run: ${refused}`)
+      done()
+      return !refused
+    } catch (error) {
+      if (this.host.closing()) throw error
+      this.failure(what, error)
+      return false
+    }
   }
   /**
    * Tells workers why their report blocks were refused, with a note under each block's comment. A refusal already

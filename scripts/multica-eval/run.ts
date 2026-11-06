@@ -21,7 +21,7 @@ import { readFileSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { parseArgs } from 'node:util'
 import { MulticaApi, type Run } from '../../src/executor/multica-api.ts'
-import { ENDED_STATUSES, inputComment, issueDescription, newNonce, parseReports, planDelivery, refusalNote, type Brief }
+import { ENDED_STATUSES, inputComment, issueDescription, newNonce, parseReports, planDelivery, refusalNote, refusalResend, type Brief }
   from '../../src/executor/multica-protocol.ts'
 import { scoreCase, type EvalMessage, type Score } from './score.ts'
 
@@ -99,6 +99,8 @@ async function runCase(label: string, agentId: string, scenario: Scenario): Prom
   log(tag, `created ${name}`)
 
   const seen = new Set<string>(), refusedOnPurpose: { commentId: string; index: number }[] = [], deliveries: Delivery[] = []
+  /** The last refused block with no report accepted after it, told again as a plain comment once the runs ended, as the executor does. */
+  let unanswered: { commentId: string; index: number; reason: string } | undefined, retried = false
   let refusalsPosted = 0, asked: boolean | undefined, laterDue = false, laterSent = false, idleSince: number | undefined, timedOut = false
   const deadline = Date.now() + timeoutMs
   for (;;) {
@@ -112,6 +114,7 @@ async function runCase(label: string, agentId: string, scenario: Scenario): Prom
         else if (scenario === 'pr' && parsed.block.tool === 'report' && !refusedOnPurpose.length) {
           reason = ON_PURPOSE; refusedOnPurpose.push({ commentId: comment.id, index })
         } else if (parsed.block.tool === 'report') {
+          unanswered = undefined
           log(tag, `report ${parsed.block.state}: ${parsed.block.summary.slice(0, 100)}`)
           if (scenario === 'question' && asked === undefined) {
             asked = parsed.block.state === 'blocked' || (parsed.block.state === 'progress' && !!parsed.block.human_action)
@@ -121,6 +124,7 @@ async function runCase(label: string, agentId: string, scenario: Scenario): Prom
         if (reason) {
           await api.addComment(issue.id, refusalNote(index, reason, nonce), { parentId: comment.id })
           refusalsPosted++
+          unanswered = { commentId: comment.id, index, reason }
           log(tag, `refused block ${index + 1}: ${reason.slice(0, 60)}`)
         }
       }
@@ -143,7 +147,12 @@ async function runCase(label: string, agentId: string, scenario: Scenario): Prom
     const allEnded = runs.length > 0 && runs.every(run => ENDED_STATUSES.has(run.status))
     if (scenario === 'question' && asked === undefined && allEnded) { asked = false; laterDue = true }
     if (scenario === 'question' && asked && allEnded) laterDue = true
-    const idle = allEnded && (!laterDue || laterSent)
+    if (allEnded && unanswered && !retried) {
+      await api.addComment(issue.id, refusalResend(unanswered.index, unanswered.reason, nonce, unanswered.commentId), { parentId: unanswered.commentId })
+      retried = true
+      log(tag, `posted the refusal of block ${unanswered.index + 1} again as a plain comment`)
+    }
+    const idle = allEnded && (!laterDue || laterSent) && !(unanswered && !retried)
     idleSince = idle ? idleSince ?? Date.now() : undefined
     if (idleSince && Date.now() - idleSince > 45_000) break
     if (Date.now() > deadline) {

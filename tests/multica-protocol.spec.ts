@@ -1,6 +1,6 @@
 /** The comment protocol between dsh-superagent and remote Multica workers. */
 import { describe, expect, it } from 'vitest'
-import { inputComment, issueDescription, isRefusalNote, newNonce, parseReports, planDelivery, refusalNote, refusedOutcome, REPORT_FENCE, type Brief }
+import { inputComment, issueDescription, isRefusalNote, newNonce, parseReports, planDelivery, refusalNote, refusalResend, refusedOutcome, REPORT_FENCE, type Brief }
   from '../src/executor/multica-protocol.ts'
 
 const brief: Brief = { ticketId: 't1', assignmentId: 'a1', nonce: 'n1', title: 'Fix it', assignment: '{"ticket_id":"t1"}',
@@ -39,6 +39,13 @@ describe('issue description', () => {
     expect(text).toContain('`agent/fix-it`')
     expect(text).toContain('"assignment":"a1","nonce":"n1"')
     expect(text.endsWith('```json\n{"ticket_id":"t1"}\n```')).toBe(true)
+  })
+  it('makes acknowledging each new trigger the first step, before any other work', () => {
+    const text = issueDescription(brief)
+    const rule = text.split('\n').find(line => /`ack`/.test(line) && /before any other step/i.test(line))
+    expect(rule).toBeDefined()
+    // It comes before the reporting examples, where a worker reads it before it starts.
+    expect(text.indexOf(rule!)).toBeLessThan(text.indexOf('```superagent-report'))
   })
   it('makes fresh nonces', () => { expect(newNonce()).not.toBe(newNonce()) })
   it('puts the inputs of one delivery in one comment', () => {
@@ -80,6 +87,14 @@ describe('refusal notes', () => {
     expect(isRefusalNote(note, 0)).toBe(true)
     expect(isRefusalNote(note, 1)).toBe(false)
     expect(isRefusalNote('/note something else', 0)).toBe(false)
+  })
+  it('are posted again as a plain comment, which starts a run, naming the comment and block and never the nonce', () => {
+    const retry = refusalResend(1, 'the engine said n1 is wrong', 'n1', 'k7')
+    expect(retry.startsWith('/')).toBe(false)
+    expect(retry).toContain('report block 2 in comment k7')
+    expect(retry).toContain('the engine said <nonce> is wrong')
+    expect(retry).not.toContain('n1')
+    expect(retry).toMatch(/post the report again/)
   })
   it('are explained to the worker in the issue description', () => {
     expect(issueDescription(brief)).toContain('/note superagent:')
