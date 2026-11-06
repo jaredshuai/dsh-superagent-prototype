@@ -13,11 +13,17 @@ const comment = (content: string, extra: Partial<EvalComment> = {}): EvalComment
 const ack = (extra?: Partial<EvalComment>) => comment(block({ tool: 'ack', trigger_id: 't1', text: 'On it.' }), extra)
 const report = (state = 'ready', extra?: Partial<EvalComment>) => comment(block({ tool: 'report', state, summary: 'Done.' }), extra)
 const evalCase = (comments: EvalComment[], more: Partial<EvalCase> = {}): EvalCase => ({ agentId: AGENT, assignment: 'a1', nonce: 'n1',
-  triggerId: 't1', comments, runs: [{ id: 'r1', status: 'completed' }], messages: {}, refusedOnPurpose: [], ...more })
+  comments, runs: [{ id: 'r1', status: 'completed' }], messages: {}, refusedOnPurpose: [], ...more })
 
 describe('acknowledgement', () => {
   it('counts an ack posted before the first report as acknowledging first', () => {
     expect(scoreCase(evalCase([ack(), report()])).ack).toBe('first')
+  })
+  it('counts an ack posted after the first commit as late, even when it comes before the report', () => {
+    const early = ack(), later = report()
+    const messages = { r1: [{ seq: 1, type: 'tool_use', created_at: '2026-11-06T00:00:00.500Z', input: { command: 'git-agent commit -m x' } }] }
+    expect(scoreCase(evalCase([early, later], { messages })).ack).toBe('late')
+    expect(scoreCase(evalCase([early, later], { messages: { r1: [{ ...messages.r1[0]!, created_at: '2026-11-06T00:10:00Z' }] } })).ack).toBe('first')
   })
 })
 

@@ -10,7 +10,8 @@
  *     [--answer immediate|after-run] [--timeout <seconds per case>]
  *
  * (Bundled first: Node only strips types, and the executor's API client uses parameter properties.) Results and each
- * case's comments, runs and run messages are written to the current directory.
+ * case's comments, runs and run messages are written to the current directory. Unlike the executor (ADR 0002) it polls
+ * every 3 s: it is a short-lived tool, and the polling delays its refusal replies by up to that much.
  *
  * It reads the Multica server, workspace and token from `~/.multica/config.json`, works in the repository of
  * `--repository` (default the sandbox), and leaves the issues, branches and pull requests for the operator to clean up.
@@ -19,7 +20,7 @@ import { execFileSync } from 'node:child_process'
 import { readFileSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { parseArgs } from 'node:util'
-import { MulticaApi, type Comment, type Run } from '../../src/executor/multica-api.ts'
+import { MulticaApi, type Run } from '../../src/executor/multica-api.ts'
 import { ENDED_STATUSES, inputComment, issueDescription, newNonce, parseReports, planDelivery, refusalNote, type Brief }
   from '../../src/executor/multica-protocol.ts'
 import { scoreCase, type EvalMessage, type Score } from './score.ts'
@@ -63,7 +64,7 @@ function task(label: string, scenario: Scenario): { title: string; text: string;
 }
 
 interface Delivery { commentId: string; kind: 'steer' | 'comment'; at: string; receipts?: unknown }
-export interface CaseResult {
+interface CaseResult {
   label: string; scenario: Scenario; agentId: string; issue: string; branch: string; startedAt: string; endedAt: string
   timedOut: boolean; deliveries: Delivery[]; refusalsPosted: number; asked?: boolean; score: Score
   check: Record<string, unknown>
@@ -86,9 +87,11 @@ async function runCase(label: string, agentId: string, scenario: Scenario): Prom
   const nonce = newNonce(), assignmentId = `asg-${tag}`, triggerId = `trg-${tag}`, branch = `agent/eval-${tag}`
   const { title, text, later } = task(label, scenario)
   const startedAt = new Date().toISOString()
+  /** A Trigger as a worker sees it, like the executor's trigger card. */
+  const card = (id: string, body: string, at: string) => ({ trigger_id: id, from: 'jaredshuai', thread: `github:${repository}#eval`, at, text: body })
   const assignment = JSON.stringify({ ticket_id: `eval-${tag}`, title,
     assignment: 'Do what the trigger asks in the repository named above. This is a protocol evaluation run (#7) on a sandbox repository.',
-    trigger: { trigger_id: triggerId, from: 'jaredshuai', thread: `github:${repository}#eval`, at: startedAt, text } }, null, 2)
+    trigger: card(triggerId, text, startedAt) }, null, 2)
   const brief: Brief = { ticketId: `eval-${tag}`, assignmentId, nonce, title, assignment, repository: `https://github.com/${repository}`, branch,
     instructions: 'Use `git-agent` for every git command and `gh-agent` for every gh command, so commits and pull requests come from the agent account.' }
   const issue = await api.createIssue({ title: `[eval #7] ${label}: ${title}`, description: issueDescription(brief), agentId })
@@ -123,14 +126,13 @@ async function runCase(label: string, agentId: string, scenario: Scenario): Prom
       }
     }
     // The mid-run message goes in once the first run has been running for a while, so it lands while the worker is busy.
-    const first = runs.at(-1)
-    if (scenario === 'steer' && !laterSent && first?.status === 'running' && first.started_at && Date.now() - Date.parse(first.started_at) > 25_000) laterDue = true
+    const firstRun = runs.at(-1) // runs are newest first
+    if (scenario === 'steer' && !laterSent && firstRun?.status === 'running' && firstRun.started_at && Date.now() - Date.parse(firstRun.started_at) > 25_000) laterDue = true
     if (laterDue && !laterSent && later) {
       const plan = planDelivery(runs.map(run => ({ id: run.id, status: run.status, canSupplement: run.can_supplement ?? undefined })))
       if (plan.kind !== 'wait') {
-        const card = JSON.stringify({ trigger_id: `${triggerId}-2`, from: 'jaredshuai', thread: `github:${repository}#eval`, at: new Date().toISOString(),
-          text: later, replies_to: { trigger_id: triggerId, preview: text.slice(0, 160) } })
-        const posted = await api.addComment(issue.id, inputComment([card]), plan.kind === 'steer' ? { steer: [plan.runId] } : {})
+        const message = JSON.stringify({ ...card(`${triggerId}-2`, later, new Date().toISOString()), replies_to: { trigger_id: triggerId, preview: text.slice(0, 160) } })
+        const posted = await api.addComment(issue.id, inputComment([message]), plan.kind === 'steer' ? { steer: [plan.runId] } : {})
         deliveries.push({ commentId: posted.id, kind: plan.kind, at: new Date().toISOString(), receipts: posted.supplements ?? undefined })
         laterSent = true
         log(tag, `delivered the later message by ${plan.kind}`)
@@ -141,7 +143,7 @@ async function runCase(label: string, agentId: string, scenario: Scenario): Prom
     const allEnded = runs.length > 0 && runs.every(run => ENDED_STATUSES.has(run.status))
     if (scenario === 'question' && asked === undefined && allEnded) { asked = false; laterDue = true }
     if (scenario === 'question' && asked && allEnded) laterDue = true
-    const idle = runs.length > 0 && runs.every(run => ENDED_STATUSES.has(run.status)) && (!laterDue || laterSent)
+    const idle = allEnded && (!laterDue || laterSent)
     idleSince = idle ? idleSince ?? Date.now() : undefined
     if (idleSince && Date.now() - idleSince > 45_000) break
     if (Date.now() > deadline) {
@@ -157,7 +159,7 @@ async function runCase(label: string, agentId: string, scenario: Scenario): Prom
   const ordered: Run[] = [...runs].reverse()
   const messages = Object.fromEntries(await Promise.all(ordered.map(async run => [run.id, await runMessages(run.id)] as const)))
   writeFileSync(`multica-eval-${tag}.messages.json`, JSON.stringify({ comments, runs: ordered, messages }, null, 2))
-  const score = scoreCase({ agentId, assignment: assignmentId, nonce, triggerId, comments: comments as Comment[], runs: ordered, messages, refusedOnPurpose })
+  const score = scoreCase({ agentId, assignment: assignmentId, nonce, comments, runs: ordered, messages, refusedOnPurpose })
   const check: Record<string, unknown> = { runs: ordered.map(run => `${run.id.slice(0, 8)} ${run.status}${run.error ? ` (${run.error.slice(0, 80)})` : ''}`) }
   if (scenario === 'pr') check.pulls = gh(['pr', 'list', '-R', repository, '--head', branch, '--state', 'all', '--json', 'number,author,state']).trim()
   else check.file = fileOnBranch(`evals/${label}-${scenario}.md`, branch)

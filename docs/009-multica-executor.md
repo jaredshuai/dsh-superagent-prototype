@@ -425,9 +425,9 @@ PR #8 的作者与提交作者都是 `jaredwtt1203`。
 | | claude | codebuddy | opencode | codex |
 | --- | --- | --- | --- | --- |
 | Issue（pr / question / steer） | JAR-58 / 62 / 67 | JAR-59 / 63 / 66 | JAR-60 / 65 / 68 | JAR-61 / 64 / 69 |
-| 先发 `ack` | 3/3 先于回报（试点 JAR-57 没发） | 1/3 | 0/3 | 0/1 |
+| 先发 `ack`（早于第一次 commit / push / 开 PR，也早于回报） | 1/3：question 先发；pr 在 commit 之后才发，steer 与最终回报一起发；试点 JAR-57 没发 | 1/3（steer） | 0/3 | 0/1 |
 | 每个结束的 run 都贴了被接受的 `report` | pr 没有（被拒后没重发），其余是 | 5/5 | 5/5 | pr 没有（同 claude） |
-| 回报块格式 | 全部合法，无一自然被拒，没有用错围栏 | 同左 | 同左 | 同左 |
+| 回报块格式 | 全部通过 `parseReports`，无一自然被拒，没有用错围栏 | 同左 | 同左 | 同左 |
 | 后续 run 的 checkout | 不适用：后续消息都 steer 进同一个 run | question 换了 daemon，新目录里 `clone --branch`；steer 复用原目录 | question 复用；steer 新目录里 clone 成功 | 未测到（见下） |
 | 回报块被拒后纠正 | **没有**：`comment add` 后紧接着在同一条命令里 `comment list`，拒收回复还没出现，run 随即结束 | 同一 run 内纠正 | 同一 run 内纠正 | **没有**：只在开头列过评论，发完回报不再看 |
 | 重复已完成步骤 | 无（PR 1 个；pilot 中 `pr create` 因 TLS 超时重试一次，不算重复） | 无：steer 消息在 run 1 里经评论读到并完成，run 2 只核对后回报「已处理」 | 无：同 codebuddy | — |
@@ -439,20 +439,28 @@ PR #8 的作者与提交作者都是 `jaredwtt1203`。
 为排除 steer，又在回答改为 run 结束后普通评论的方式下重跑提问（JAR-70），run 同样在第二次工具调用后停住；此时在本机直接 `codex exec "Reply with the single word OK."` 120 s 也没有回答。
 所以是 jxccs 上 codex 配置的模型服务（`newapi` 自定义 provider）不响应，与协议无关；codex 只有 pr 一项结果可用，需要在 provider 恢复后重测（#15）。
 
+**测量的局限**：
+
+- 每个 runtime 每个场景只跑一次；「拒收后纠正」每个 runtime 只有一次人为拒收，自然被拒的样本为 0。
+- 人为拒收的原因如实写了「the block itself was valid」，执行器发的是真实错误；读到它的 Worker（codebuddy、opencode）都照样重发了，没读到的（Claude、codex）不受影响。
+- 脚本只做 `parseReports` 这一层校验，不做执行器的 PR 认领与 `follow` 线程校验；本次所有 `pr_number` 都对应该分支开的 PR，所以「无一被拒」不受影响。
+- checkout 一项按 run 的命令与输出判断：后续 run 若落在另一个 daemon 的新目录（工作目录不同），按分支 clone 也算正确，只有撞上已存在目录才算不幂等。
+
 **结论**：
 
 - 四个 runtime 都能读懂并遵守描述里的协议：回报块从未写错格式、nonce 与 assignment 都对；需要人时都用 `blocked` + `human_action` 提问；
   后续 run 都先读评论与分支、不重做已完成的步骤；后续 run 的 checkout 没有一次撞上已存在的目录（第 7.1 节第 3 项要求的幂等写法有效）。
-- `ack` 是最不被遵守的一条：只有 Claude 稳定地先发。描述里只在示例里说「before substantial work」，没有要求必须先发。
+- `ack` 是最不被遵守的一条：12 个有效用例里只有 2 个在动手前发（Claude、codebuddy 各一次），Claude 另有两次是做完之后补发。描述里只在示例里说「before substantial work」，没有要求必须先发。
 - **拒收后纠正取决于 Worker 何时看评论**：codebuddy、opencode 发完回报后会再列评论并在同一 run 内改正；Claude 发完立即列评论（早于拒收回复），codex 根本不再看，
-  而回报往往是 run 的最后一步，`/note` 又不起 run，于是被拒的最终回报**永远不会被改正**，Ticket 只能靠 run 结束兜底记为 `waiting`。
+  而回报往往是 run 的最后一步，`/note` 又不起 run，于是在这两个 runtime 上被拒的最终回报**没有机会改正**，Ticket 只能靠 run 结束兜底记为 `waiting`
+  （每个 runtime 只测了一次人为拒收，但原因是确定的：拒收回复出现时 Worker 已不再看评论）。
   执行器的回复比本脚本快，但同样快不过「同一条命令里紧接着 list」。这是协议说明要调整的地方（#13）。
 - 能 steer 的 runtime（Claude）把中途消息带进同一个 run，费用最低；不能 steer 的 codebuddy、opencode 会在 run 中途主动列评论读到新消息，
   之后排的那个 run 只做核对，多花一个短 run，但不重复工作。
 
 **派工建议**（`MULTICA_AGENT_IDS` 的顺序）：
 
-1. **Claude 放第一**：协议遵从最完整（`ack`、steer、提问），最适合会追加消息、要来回问答的 Ticket；缺点是被拒的最终回报不会自己改正（#13 改描述后复测）。
+1. **Claude 放第一**：协议遵从最完整（steer、提问，最常发 `ack`），最适合会追加消息、要来回问答的 Ticket；缺点是被拒的最终回报不会自己改正（#13 改描述后复测）。
 2. **codebuddy 第二**：最快的非 steer runtime，每个 run 都回报、被拒会改正，适合小改动开 PR 这类一轮能完成的 Ticket；免费模型，可作默认的低成本备份。
 3. **opencode 第三**：遵从度与 codebuddy 相当但慢 2–4 倍，且有免费额度用完的前科（第 8.2 节），只作备份。
 4. **codex 暂不放进候选**：pr 一项可用但不发 `ack`、被拒不改正，其余两项因本机 provider 故障无结果（#15）。
