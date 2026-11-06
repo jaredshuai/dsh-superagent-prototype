@@ -282,7 +282,7 @@ daemon_id 是机器级的，存在 `~/.multica/daemon.id`，CLI daemon 与桌面
 **部署**：服务器 `superagent-sv`（`~/src/dsh-superagent`，`multica-executor` 分支）。`~/.config/superagent.env`（由 `~/.profile` 引入）追加
 `SUPERAGENT_EXECUTOR=multica`、`MULTICA_WORKSPACE_ID`、`MULTICA_AGENT_IDS=<superagent-worker-jxccs>`、`SUPERAGENT_MULTICA_REPOSITORY`、
 `SUPERAGENT_MULTICA_INSTRUCTIONS`（git/gh 一律用 `git-agent` / `gh-agent`）；`MULTICA_TOKEN` 从工作站 `~/.multica/config.json` 经 SSH 管道直接追加，
-不经终端。`bash -lc "scripts/dsh-superagent restart"` 重启后 `worker` 健康项为 `Connected to Multica`。
+不经终端。服务跑的是 `lib/` 里的构建产物，更新代码后要先 `pnpm build`；`bash -lc "scripts/dsh-superagent restart"` 重启后 `worker` 健康项为 `Connected to Multica`。
 切换前先停掉了两张 DshExecutor 开的旧 Ticket：MulticaExecutor 对没有 `multica-ticket:` 状态的 Ticket 不投递，留着只会一直挂着。
 
 **GitHub 入口时间线（superagent-sandbox #6 → Multica JAR-53 → PR #7，UTC）**：
@@ -348,7 +348,7 @@ PR #8 的作者与提交作者都是 `jaredwtt1203`。
 
 - ~~Ticket 结束（停止或 PR 合并）时 Multica issue 不会关闭（JAR-53/54/55 仍是 in_review / todo），工作区里会积累活跃 issue。~~
   已做（#9），见第 8 节「Ticket 结束时关闭 issue」。改状态的请求体取自 multica CLI 0.8.0 对本地假服务器发出的请求；
-  同样的请求（CLI `--no-start`）已把 JAR-53/54/55 关掉且没起 run，但执行器自己的关闭还没在线上走过。
+  同样的请求（CLI `--no-start`）已把 JAR-53/54/55 关掉且没起 run，执行器自己的关闭也已在线上走过：2026-11-06 合并 superagent-sandbox PR #10 后 Ticket 结束，JAR-56 随即变为 `done`，没有起 run（第 8.3 节）。
 
 **还没验证**：重启中的 run 正常结束（那个 run 因 jxccs 上 opencode 免费额度用完而 failed，但重启本身没有打断它）。
 
