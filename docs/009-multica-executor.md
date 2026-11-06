@@ -289,6 +289,9 @@ daemon_id 是机器级的，存在 `~/.multica/daemon.id`，CLI daemon 与桌面
     - 10:29:37 解冻；4 s 后（10:29:41）收到恢复事件，改派回 jxccs（a2 → a3，A→B→A），run 1 s 内被认领。10:30:12 a3 的 `ack`、10:30:15 `ready`（"drill: ran on jxccs"）。
       a1、a2 期间的评论没有被重新处理。
     - 事后 issue 上恰好 3 个 run：jxccs cancelled、JaredAI failed、jxccs completed；没有并行的活跃 run，旧 runtime 回来后也没有残留的 `deferred` 重试。
+    - **重跑（同日，JAR-80）**：第二候选换成 JaredAI 上已登录的 MiniMax Code（探针 `failover-test-jaredai-mcode`），流程同上。10:41:08 run 在 jxccs 排队；
+      10:46:09（5 分 1 秒）改派，旧 run 取消；JaredAI 的 run 4 s 后 running，10:47:11 `ack`、10:47:27 `ready`（"drill: ran on JAREDAI"）。
+      解冻后 jxccs 回到 online，issue 上只有 2 个 run（jxccs cancelled、JaredAI completed），旧 agent 没有再起 run。即：一台工作站离线，Ticket 在另一台跑完。
     - 替身的局限：问题由 `ticket.attention` 判断是否还挂着，替身 Engine 不设 attention，所以改派成功后的 `question: null` 撤下没有在演练里出现（单测覆盖）。
     - 结论：5 分钟阈值、取消后改派、按错误文本判不可重试、全部离线时问人、恢复后自动改派这几条在真实环境里都按设计工作。尚未实测的是「run 执行中整机掉线、Multica 以 `runtime_offline` 判失败」：
       它要等重连宽限期，路径与上面的失败分类相同。
