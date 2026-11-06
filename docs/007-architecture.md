@@ -357,6 +357,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/executor/multica-candidates.ts` | `MulticaCandidates`, which configured candidate Multica agent can take a new ticket, from a snapshot of the workspace's agents and runtimes |
 | `src/executor/multica-events.ts` | `MulticaEvents`, the Multica workspace event stream over WebSocket, with reconnection and a catch-up call on every connection |
 | `src/executor/multica-protocol.ts` | The comment protocol with remote workers: the issue description, Input comments, `superagent-report` blocks and `planDelivery` |
+| `scripts/multica-eval/run.ts`, `score.ts` | The runtime protocol evaluation (#7, 009 §8.4): runs the same tasks on Multica agents of several runtimes with the executor's protocol code, and `scoreCase`, which scores each case from its comments, runs and run messages |
 | `src/executor/background.ts` | A worker's background work in DeepSeek Harness, the shell jobs its Session owns (`ctx.jobs`) and its subagents (`ctx.subagents`): `runningJobs`, `untilQuiet`, `killJobs`, `collectJobs`, `stopSubagents`, `stopBackground`, `until`, and `cancelled`, the workers whose turn a stop of their subagents cancelled |
 | `src/infra/commands.ts` | `Commands`, the CLI transport: `run`; `api` and `pages`, limited to the configured repository and validated; `lark` as the bot; `git`. `CliError` carries the code a command's output reports, such as a GitHub HTTP status, and a command that prints nothing fails with how it ended, never with its arguments; `validItems` skips and counts the malformed items of a list |
 | `src/infra/environment.ts` | The agent's process environment: command shims, the git configuration and credential helper, `runAsWorker`, and the checks of the environment and of a Ticket's directory |
@@ -424,6 +425,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `tests/multica-api.spec.ts` | `MulticaApi`: the request that creates a ticket's issue, which allows an active issue of the same title, and the status change that starts no run |
 | `tests/multica-config.spec.ts` | `multicaConfigFromEnv`: the single agent and the ordered candidate list, and what is missing |
 | `tests/multica-events.spec.ts` | `MulticaEvents`: first-frame auth, event deduplication, reconnection with backoff and a catch-up on every connection |
+| `tests/multica-eval.spec.ts` | `scoreCase` of the runtime protocol evaluation: acknowledging first, the report that ends each run, block format, checkout reuse in later runs, correction after a refused block, and steps done twice |
 | `tests/effects.spec.ts` | The effect queue: coalescing, limits, retries with backoff, health and shutdown |
 | `tests/passes.spec.ts` | Passes: one at a time, the ones asked for during a pass run as one after it, and the runtime health a failed pass reports |
 | `tests/outbox.spec.ts` | The Outbox on a running Runtime: messages wait while processing is paused or their Source is not installed |
