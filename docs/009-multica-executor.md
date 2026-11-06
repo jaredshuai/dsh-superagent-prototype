@@ -278,13 +278,26 @@ daemon_id 是机器级的，存在 `~/.multica/daemon.id`，CLI daemon 与桌面
     记在 `worker` 健康项，下次对账（事件、计时器或重连后的补齐）再做。
   - 已知局限：未认领时长用服务端的 `created_at` 对本机时钟，两边时钟偏差会让阈值早到或晚到；健康 agent 因并发已满让 run 排队超过 5 分钟也会被改派；
     因不可重试的失败被暂停的原候选，暂停到期后不会自动重新考虑（只找“其他”候选），若其他候选一直不在线，Ticket 停在问人那一步，靠人重试。
-  - 待做：真实环境演练（让一台工作站离线，看改派到另一台），结论补在这里。
+  - **实测（2026-11-06，`scripts/multica-drill/reassign.ts`，JAR-79）**：脚本跑真实的 MulticaExecutor（真实 API、事件流、时钟），只把 Engine 与存储换成记录用的替身。
+    候选依次为 `failover-test-jxccs`（jxccs，Opencode）与新建探针 `failover-test-jaredai`（JaredAI，Opencode）。`kill -STOP` 冻结 jxccs 的 CLI 与桌面端两个 daemon 后立刻建 Ticket，
+    此时 runtime 还显示 online，issue 派给 jxccs。时间线（UTC）：
+    - 10:22:36 建 issue、run 排队，无人认领。10:27:36（排队 5 分 0 秒）计时器到点，存下 `reassigning`；1 s 内取消旧 run、改指派、Engine `assignmentReassigned` a1 → a2，
+      JaredAI 上新 run 4 s 后 running。全程没有轮询，只在这一刻对账。
+    - 10:27:59 JaredAI 的 run 失败：`failure_reason` 只是 `agent_error.unknown`，`error` 为 `opencode … Authentication required: provider authentication required`（该机 opencode 未登录）。
+      按不可重试处理：暂停 JaredAI 候选；此时 jxccs 仍离线，没有其他健康候选，问人一次（「…none of the other candidate Multica agents…」），issue 不动。
+      ——意外但正好覆盖了 2b 层：笼统的 `agent_error.*` 必须看错误文本才分得出。
+    - 10:29:37 解冻；4 s 后（10:29:41）收到恢复事件，改派回 jxccs（a2 → a3，A→B→A），run 1 s 内被认领。10:30:12 a3 的 `ack`、10:30:15 `ready`（"drill: ran on jxccs"）。
+      a1、a2 期间的评论没有被重新处理。
+    - 事后 issue 上恰好 3 个 run：jxccs cancelled、JaredAI failed、jxccs completed；没有并行的活跃 run，旧 runtime 回来后也没有残留的 `deferred` 重试。
+    - 替身的局限：问题由 `ticket.attention` 判断是否还挂着，替身 Engine 不设 attention，所以改派成功后的 `question: null` 撤下没有在演练里出现（单测覆盖）。
+    - 结论：5 分钟阈值、取消后改派、按错误文本判不可重试、全部离线时问人、恢复后自动改派这几条在真实环境里都按设计工作。尚未实测的是「run 执行中整机掉线、Multica 以 `runtime_offline` 判失败」：
+      它要等重连宽限期，路径与上面的失败分类相同。
 - 重启：远端 run 不受影响，所以 `resume` 不打断 running 的 Assignment，只重新排队 pending 的启动；连接建立后的补齐会追上错过的事件。
 
 **还没做**：
 
 1. ~~回报被拒只记在 `worker` 健康项里~~：已做，见上「回报被拒的反馈」与第 8.1 节。
-2. ~~多候选 agent~~：已做，见上「多候选」。~~跨机故障转移与改派（第 4 节第 2、2b 层）~~：已做，见上「跨工作站改派」（#8）；真实环境演练还没做。
+2. ~~多候选 agent~~：已做，见上「多候选」。~~跨机故障转移与改派（第 4 节第 2、2b 层）~~：已做，见上「跨工作站改派」（#8），真实环境演练见同处（2026-11-06）。
 3. ~~线上端到端联调~~：GitHub 与飞书私聊入口都已跑通到 PR 合并、Ticket 结束，见第 8.2 节。
 4. 第 7 节第 6 项（MCP 注入）。第 5 项（各 runtime 对协议的遵从度）已评估（#7，第 8.4 节），steer 投递路径已在线上实测（#6，第 8.3 节）。
 5. ~~Ticket 结束时关闭 issue~~：已做（#9），见上「Ticket 结束时关闭 issue」。
