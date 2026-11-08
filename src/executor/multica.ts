@@ -90,9 +90,15 @@ export interface MulticaTicketState {
   closed?: IssueEnd
   /**
    * A reassignment of the issue to another candidate still to do, for the Assignment it was decided for: saved before its
-   * first step, so a crash or a failed request part way does it again, and kept while no candidate can take it.
+   * first step, so a crash or a failed request part way does it again, and kept while no candidate can take it. `fatal`
+   * when its agent's run failed for a reason that suspended it: once the suspension is over, the agent may take it again.
    */
-  reassigning?: { assignmentId: string; reason: string }
+  reassigning?: { assignmentId: string; reason: string; fatal?: true }
+  /**
+   * The agent the issue went back to once its suspension was over: it gets no second such return, so an agent that keeps
+   * failing the same way leaves the ticket to a person instead of costing an Assignment every `SUSPEND_MS`.
+   */
+  returnedTo?: string
 }
 /** A comment that carried Inputs to the issue's runs. */
 export interface Delivery {
@@ -110,13 +116,21 @@ export const MULTICA_KV = {
   /**
    * A ticket whose first Assignment waits for a healthy candidate, or whose issue waits for one to be reassigned to, once a person has been asked to start a workstation, and what they were asked. */
   waiting: family<{ assignmentId: string; question: string }>('multica-waiting:'),
-  /** An ended ticket whose issue is not closed yet, and the status it is closed with; kept until Multica took it. */
-  closing: family<{ status: IssueEnd }>('multica-closing:'),
+  /**
+   * An ended ticket whose issue is not closed yet, and the status it is closed with; kept until Multica took it. A ticket its
+   * worker's report ended lets a run still running finish until `graceUntil` (epoch milliseconds), as after `ready`.
+   */
+  closing: family<{ status: IssueEnd; graceUntil?: number }>('multica-closing:'),
 }
 /** The Multica status an ended ticket's issue moves to. */
 export type IssueEnd = 'done' | 'cancelled'
 /** A ticket that ended with its result or its PR merged is done; one closed unmerged, with nothing to do, or stopped is cancelled. */
 const issueEnd = (outcome: TicketOutcome): IssueEnd => outcome === 'completed' || outcome === 'merged' ? 'done' : 'cancelled'
+/**
+ * How long a run still running when its worker's report ended the ticket may go on before the issue is closed, which
+ * cancels it: a worker reports `ready` and then finishes its run, such as by cleaning up (JAR-84, JAR-85, #18).
+ */
+export const CLOSE_GRACE_MS = 2 * 60_000
 const SEEN_LIMIT = 500
 /** How many cancelled runs, deliveries and pending refusal notes a ticket's state keeps. */
 const HISTORY_LIMIT = 50
@@ -187,6 +201,16 @@ export class MulticaExecutor implements Executor {
   private readonly stranded = new Set<string>()
   /** Per ticket, the timer that reconciles it once its unclaimed run has waited `UNCLAIMED_LIMIT_MS`. */
   private readonly unclaimed = new Map<string, () => void>()
+  /** Per ended ticket, the timer that closes its issue once the grace of its last run is over. */
+  private readonly graces = new Map<string, () => void>()
+  /** Per suspended candidate, the timer that takes a new health snapshot when its suspension is over, to reconsider it. */
+  private readonly resumes = new Map<string, () => void>()
+  /**
+   * Per ticket, the `worker` health detail its last refused block that may have been a report set, and for which Assignment:
+   * a report of that Assignment accepted later sets the entry back to ready while it still shows that refusal, since the
+   * worker fixed it (JAR-84, #18). The entry has one slot, so a later failure of any kind replaces the refusal there.
+   */
+  private readonly refusalHealth = new Map<string, { assignmentId: string; detail: string }>()
   private readonly clock: Clock
   constructor(private readonly host: MulticaExecutorHost) {
     this.clock = host.clock ?? realClock
@@ -232,7 +256,9 @@ export class MulticaExecutor implements Executor {
   async shutdown(): Promise<void> { this.events.stop(); this.clearTimers(); await Promise.allSettled([...this.chains.values()]) }
   dispose(): void { this.events.stop(); this.clearTimers() }
   /** Cancels the timers of unclaimed runs; the catch-up after the next start arms them again. */
-  private clearTimers(): void { for (const cancel of this.unclaimed.values()) cancel(); this.unclaimed.clear() }
+  private clearTimers(): void {
+    for (const timers of [this.unclaimed, this.graces, this.resumes]) { for (const cancel of timers.values()) cancel(); timers.clear() }
+  }
   /** Open tickets whose issue has a run in progress. */
   activeCount(): number {
     return this.host.store.tickets.open().filter(ticket => runningAssignment(ticket)
@@ -246,8 +272,11 @@ export class MulticaExecutor implements Executor {
   }
   private agentOf(state: MulticaTicketState): string { return state.agentId ?? this.host.config.agents[0]! }
   private healthy(detail: string): void { this.host.health.set({ state: 'ready', detail, at: now() }) }
-  private failure(what: string, error: unknown): void {
-    this.host.health.set({ state: 'error', detail: `${what}: ${errorText(error)}`, at: now() })
+  /** Records a failure in the `worker` health entry; returns the detail it set. */
+  private failure(what: string, error: unknown): string {
+    const detail = `${what}: ${errorText(error)}`
+    this.host.health.set({ state: 'error', detail, at: now() })
+    return detail
   }
 
   /** The assignment a remote worker receives: what a DSH worker's first message holds, with trigger texts in full. */
@@ -316,7 +345,7 @@ export class MulticaExecutor implements Executor {
         this.save(ticketId, { ...open, assignment: { id: assignmentId, nonce }, runs: Object.fromEntries(before.map(run => [run.id, run.status])),
           cancelled: [...state.cancelled ?? [], ...before.filter(run => !ENDED_STATUSES.has(run.status)).map(run => run.id)].slice(-HISTORY_LIMIT) })
         const moved = first.ticket.assignments.at(-2)?.endedReason === 'reassigned'
-          ? `it moved here from another workstation (Multica agent ${this.agentOf(state)} now runs it).` : undefined
+          ? `it was reassigned, and Multica agent ${this.agentOf(state)} runs it now; the first new message says why.` : undefined
         const posted = await this.host.api.addComment(state.issueId, laterAssignmentComment(brief, moved))
         // A ticket that ended while the comment was posted may have closed the issue before the comment started a run.
         const ended = this.host.store.tickets.get(ticketId)
@@ -451,8 +480,9 @@ export class MulticaExecutor implements Executor {
     }
   }
 
-  private async cancelActive(ticketId: string, issueId: string): Promise<void> {
-    const runs = await this.host.api.runs(issueId)
+  /** Cancels the issue's active runs, recorded first as cancelled by this executor; `known` are its runs when just read. */
+  private async cancelActive(ticketId: string, issueId: string, known?: readonly Run[]): Promise<void> {
+    const runs = known ?? await this.host.api.runs(issueId)
     const active = runs.filter(run => !ENDED_STATUSES.has(run.status))
     if (!active.length) return
     const state = this.state(ticketId)
@@ -493,7 +523,7 @@ export class MulticaExecutor implements Executor {
     const state = this.state(ticketId)
     const ticket = this.host.store.tickets.get(ticketId)
     const closing = this.host.store.get(MULTICA_KV.closing(ticketId))
-    if (state && ticket && !liveTicket(ticket) && closing) return this.close(ticketId, state, closing.status)
+    if (state && ticket && !liveTicket(ticket) && closing) return this.close(ticketId, state, closing)
     if (!state || !ticket || !liveTicket(ticket)) return
     const [runs, comments] = await Promise.all([this.host.api.runs(state.issueId), this.host.api.comments(state.issueId)])
     // Reports first, so a report and the end of the turn that made it arrive in that order.
@@ -618,7 +648,10 @@ export class MulticaExecutor implements Executor {
       if (this.stranded.has(ticketId) || this.host.store.get(MULTICA_KV.waiting(ticketId))) this.dispatched(ticketId, agent)
       return undefined
     }
-    const decided = (reason: string) => { this.save(ticketId, { ...this.state(ticketId)!, reassigning: { assignmentId, reason } }); return reason }
+    const decided = (reason: string, fatal = false) => {
+      this.save(ticketId, { ...this.state(ticketId)!, reassigning: { assignmentId, reason, ...fatal ? { fatal } : {} } })
+      return reason
+    }
     const failed = lastEnded(ended.filter(run => run.status === 'failed'))
     if (failed) {
       const messages = failureByReason(failed) ? [] : await this.host.api.runMessages(failed.id).catch((error: unknown) => {
@@ -626,9 +659,9 @@ export class MulticaExecutor implements Executor {
         return []
       })
       const kind = failureKind(failed, messages)
-      if (kind === 'fatal') this.candidates.suspend(agent, this.clock.now() + SUSPEND_MS)
+      if (kind === 'fatal') this.suspend(agent)
       if (kind) return decided(`its run ${failed.id} on Multica agent ${agent} failed (${failed.failure_reason ?? 'no reason given'}`
-        + `${failed.error ? `: ${failed.error}` : ''})${kind === 'fatal' ? ', which that workstation would only repeat' : ''}`)
+        + `${failed.error ? `: ${failed.error}` : ''})${kind === 'fatal' ? ', which that workstation would only repeat' : ''}`, kind === 'fatal')
     }
     if (pending) return pending.reason
     const since = unclaimedSince(mine.filter(run => !(current.cancelled ?? []).includes(run.id)))
@@ -639,40 +672,69 @@ export class MulticaExecutor implements Executor {
     return undefined
   }
   /**
+   * Keeps a candidate out for `SUSPEND_MS`; when that is over, a new health snapshot reconsiders the tickets that wait for
+   * a candidate, so one stranded on this agent alone goes back to it without a person retrying it (#18).
+   */
+  private suspend(agentId: string): void {
+    this.candidates.suspend(agentId, this.clock.now() + SUSPEND_MS)
+    this.resumes.get(agentId)?.()
+    this.resumes.set(agentId, this.clock.after(SUSPEND_MS, () => { this.resumes.delete(agentId); this.refreshCandidates() }))
+  }
+  /**
    * Reassigns the ticket's issue to the first healthy candidate other than its own: cancels the issue's active runs first,
    * so no two run at once, then assigns the issue to the new agent, and in one transaction switches the ticket's agent and
    * has the Engine replace the Assignment, whose launch tells the new agent on the same issue. The old Assignment's reports
    * are refused from here on: its agent's comments are no longer read (those on the issue now count as seen, in case the
    * issue comes back to it) and the new Assignment has its own nonce. With no healthy candidate the issue stays, and a
-   * person is asked once to start a workstation, as for a new ticket.
+   * person is asked once to start a workstation, as for a new ticket. An issue moved for a failure that suspended its own
+   * agent goes back to that agent, as a new Assignment, once its suspension is over and still no other candidate is healthy.
    */
   private async reassign(ticketId: string, assignmentId: string, reason: string, comments: readonly Comment[]): Promise<void> {
     const state = this.state(ticketId)!
     const from = this.agentOf(state)
     const to = this.candidates.pick([from])
+      ?? (state.reassigning?.fatal && state.returnedTo !== from && this.candidates.healthy(from) ? from : undefined)
     if (!to) { this.stranded.add(ticketId); this.askForWorkstation(ticketId, assignmentId, [from]); return }
     await this.cancelActive(ticketId, state.issueId)
     await this.host.api.assignIssue(state.issueId, to)
     this.dispatched(ticketId, to)
-    const { assignment: _, reassigning: _reassigning, ...rest } = this.state(ticketId) ?? state
+    const { assignment: _, reassigning: _reassigning, returnedTo: _returned, ...rest } = this.state(ticketId) ?? state
     const old = comments.filter(comment => comment.author_type === 'agent' && comment.author_id === from).map(comment => comment.id)
     this.host.store.atomic(() => {
-      this.save(ticketId, { ...rest, agentId: to, seen: [...rest.seen, ...old.filter(id => !rest.seen.includes(id))].slice(-SEEN_LIMIT) })
-      this.host.engine.assignmentReassigned(ticketId, assignmentId, `This ticket moved to another workstation, Multica agent ${to}, because ${reason}. `
+      this.save(ticketId, { ...rest, agentId: to, ...to === from ? { returnedTo: to } : {}, seen: [...rest.seen, ...old.filter(id => !rest.seen.includes(id))].slice(-SEEN_LIMIT) })
+      const why = to === from
+        ? `This ticket starts again on Multica agent ${to}, which was kept out for ${SUSPEND_MS / 60_000} minutes because ${reason}, and no other workstation is online. `
+        : `This ticket moved to another workstation, Multica agent ${to}, because ${reason}. `
+      this.host.engine.assignmentReassigned(ticketId, assignmentId, why
         + 'An earlier run may have pushed work to the branch or commented on the issue: fetch the branch and read the issue\'s comments before continuing, and do not repeat finished steps.')
     })
   }
-  /** Records that an ended ticket's issue is to be closed and queues its reconciliation; returns whether the ticket has ended. */
+  /**
+   * Records that an ended ticket's issue is to be closed and queues its reconciliation; returns whether the ticket has ended.
+   * A ticket its worker's report ended, rather than a person, gives its running run `CLOSE_GRACE_MS` to finish.
+   */
   private queueCloseIfEnded(ticket: Ticket): boolean {
     if (!ticket.ended) return false
-    this.host.store.set(MULTICA_KV.closing(ticket.id), { status: issueEnd(ticket.ended.outcome) })
+    const graceUntil = this.host.store.get(MULTICA_KV.closing(ticket.id))?.graceUntil
+      ?? (ticket.ended.by === 'executor' ? this.clock.now() + CLOSE_GRACE_MS : undefined)
+    this.host.store.set(MULTICA_KV.closing(ticket.id), { status: issueEnd(ticket.ended.outcome), ...graceUntil ? { graceUntil } : {} })
     this.schedule(ticket.id)
     return true
   }
-  /** Closes an ended ticket's issue: cancels its active runs, then moves it to its end status without starting a run. */
-  private async close(ticketId: string, state: MulticaTicketState, status: IssueEnd): Promise<void> {
+  /**
+   * Closes an ended ticket's issue: cancels its active runs, then moves it to its end status without starting a run. While
+   * the close's grace lasts, a running run is left to finish: its end reconciles again, or the timer at the grace's end.
+   */
+  private async close(ticketId: string, state: MulticaTicketState, { status, graceUntil }: { status: IssueEnd; graceUntil?: number }): Promise<void> {
+    this.graces.get(ticketId)?.(); this.graces.delete(ticketId)
     try {
-      await this.cancelActive(ticketId, state.issueId)
+      const runs = await this.host.api.runs(state.issueId)
+      const left = (graceUntil ?? 0) - this.clock.now()
+      if (left > 0 && runs.some(run => run.status === 'running')) {
+        this.graces.set(ticketId, this.clock.after(left, () => { this.graces.delete(ticketId); this.schedule(ticketId) }))
+        return
+      }
+      await this.cancelActive(ticketId, state.issueId, runs)
       await this.host.api.setStatus(state.issueId, status)
       this.host.store.atomic(() => {
         this.save(ticketId, { ...this.state(ticketId) ?? state, closed: status })
@@ -709,21 +771,30 @@ export class MulticaExecutor implements Executor {
     const refused: Refusal[] = []
     let last: 'accepted' | Unanswered | undefined
     /** Refuses a block; one that may have been the report, as one that did not parse may, stands until a report is accepted. */
-    const refuse = (index: number, reason: string, report: boolean) => {
+    const refuse = (index: number, what: string, reason: string, report: boolean) => {
+      const detail = this.failure(what, reason)
+      if (report) this.refusalHealth.set(ticketId, { assignmentId: assignment.id, detail })
       refused.push({ commentId: comment.id, index, note: refusalNote(index, reason, assignment.nonce) })
       if (report) last = { assignmentId: assignment.id, commentId: comment.id, resend: refusalResend(index, reason, assignment.nonce, comment.id) }
     }
     for (const [index, parsed] of parseReports(comment.content, { assignment: assignment.id, nonce: assignment.nonce }).entries()) {
-      if (!parsed.ok) { this.failure(`Ignored a report block in comment ${comment.id}`, parsed.error); refuse(index, parsed.error, true); continue }
+      if (!parsed.ok) { refuse(index, `Ignored a report block in comment ${comment.id}`, parsed.error, true); continue }
       try {
         await this.request(ticketId, parsed.block)
-        if (parsed.block.tool === 'report') last = 'accepted'
+        if (parsed.block.tool === 'report') { last = 'accepted'; this.clearRefusalHealth(ticketId, assignment.id) }
       } catch (error) {
-        this.failure(`Report block in comment ${comment.id}`, error)
-        refuse(index, errorText(error), parsed.block.tool === 'report')
+        refuse(index, `Report block in comment ${comment.id}`, errorText(error), parsed.block.tool === 'report')
       }
     }
     return { refused, ...last ? { last } : {} }
+  }
+  /** After a report of `assignmentId` was accepted: the `worker` entry is ready again if it still shows that Assignment's last refusal. */
+  private clearRefusalHealth(ticketId: string, assignmentId: string): void {
+    const refusal = this.refusalHealth.get(ticketId)
+    if (!refusal) return
+    this.refusalHealth.delete(ticketId)
+    const health = this.host.health.get()
+    if (refusal.assignmentId === assignmentId && health?.state === 'error' && health.detail === refusal.detail) this.healthy('Connected to Multica')
   }
   /**
    * Tells the worker again, with a plain comment that starts a run, about a refused report block its run ended without

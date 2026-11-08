@@ -231,6 +231,11 @@ daemon_id 是机器级的，存在 `~/.multica/daemon.id`，CLI daemon 与桌面
   `{"status": …, "suppress_run": true}`（与 `multica issue status --no-start` 相同，改状态不起新 run）。成功才删记录；失败记在 `worker` 健康项里，
   该 issue 的下一个事件或事件流（重）连接时的补齐再试，重启后也一样。建 issue 的请求在飞时 Ticket 结束（`stop` 时还没有 issue），建好后立即按同样方式关闭。
   重试 Ticket（`retried`）时 Ticket 未结束，只取消 run，不关 issue。
+  关闭宽限（#18）：Worker 回报 `ready` 后 Ticket 立即结束，此时它的 run 往往还在收尾（JAR-84、JAR-85 的 run 因此记为 `cancelled`）。所以由回报结束的
+  Ticket（`ended.by = executor`，含 PR 合并后由 `threadClosed` 结束的）在 `multica-closing:` 里多记一个 `graceUntil`（结束时刻 + **2 分钟**，`CLOSE_GRACE_MS`）：
+  宽限内若 issue 上有 `running` 的 run，就先不取消、不改状态，只挂一个到宽限结束的计时器；run 结束的 `task:` 事件会先触发对账，那时没有活跃 run，直接关成
+  `done` / `cancelled`，run 记为 `completed`。宽限过了仍在跑才取消再关。排队 / 待派的 run 不等（那是新 run），照旧立即取消。人停的 Ticket（`by = human`）不给宽限。
+  `graceUntil` 存盘，重启后补齐时按剩余时间重挂计时器；此前写下的、没有 `graceUntil` 的记录照旧立即关。
   已关闭的 issue 状态记在 Ticket 状态的 `closed` 里：结束的 Ticket 被人的新消息唤醒时，`start` 撤掉还没完成的关闭，新 Assignment 发评论前先把 issue
   改回 `todo`（同样 `suppress_run`，run 由评论触发）。往已有 issue 发后续 Assignment 的评论期间 Ticket 结束的话，评论发出后再关一次，取消它起的 run。
   只处理这项改动上线后结束的 Ticket；更早结束的 issue 不会补关，要手动 `multica issue status <id> done|cancelled --no-start`
@@ -249,10 +254,14 @@ daemon_id 是机器级的，存在 `~/.multica/daemon.id`，CLI daemon 与桌面
   每个 Assignment 最多补发一次（`resentFor`），之后再被拒只回 `/note`、run 结束照常算等待，不会循环；同一条评论下已有 `superagent: report block`
   开头的回复就不再发（重启安全）。同一 run 内已改正的（之后有被接受的 `report`）不补发；已补发过、或换了 Assignment 的 `unanswered` 直接丢弃。
   这项改动上线前就被拒、已记为 seen 的评论没有 `unanswered`，不会补发，仍只靠 run 结束记为等待。
+  被拒块同时记进 `worker` 健康项（`Ignored a report block in comment …` / `Report block in comment …`）。之后**同一 Assignment** 有 `report` 被接受、而健康项
+  仍是该 Ticket 最后那条可能是回报的拒收（与 `unanswered` 同一口径；被拒的 `ack` 等不算）时，健康项恢复为 `ready`（`Connected to Multica`）；
+  健康项只有一个槽位，期间被别的错误（如事件流断开、另一个 Ticket 的拒收）覆盖了就不动它（#18，JAR-84）。
+  `dropped` 仍要求 `summary`：与 DshExecutor 的 `orchestrator_report` 相同，`summary` 是每个回报的必填项，`dropped` 结束 Ticket 时它就是给人的结论。
 - `ack`（#14）：issue 描述「How to report」第一条要求每个 run 在任何其他步骤之前，为每条还没确认的触发消息先发一个 `ack`，快活也要发。
 - 多候选（`MULTICA_AGENT_IDS`）：候选健康 = agent 存在、未归档、`status` 不是 `offline`，且它绑定的 runtime `status = online`。
   健康快照来自 REST `GET /api/agents` 与 `GET /api/runtimes`，只在事件流每次（重）连接时、以及收到 `agent:` / `runtime:` / `daemon:`
-  事件（`daemon:heartbeat*` 除外）时取一次（同一时刻多个请求合并成一次），不做周期轮询（ADR 0002）。快照到手之前不派新 Ticket。
+  事件（`daemon:heartbeat*` 除外）时、以及某个候选的暂停到期时（见下「跨工作站改派」）取一次（同一时刻多个请求合并成一次），不做周期轮询（ADR 0002）。快照到手之前不派新 Ticket。
   只有**新 Ticket**（还没有 issue 的）按健康挑选；已有 issue 的后续 Assignment 仍发到该 issue 已指派的 agent，换 agent 只经改派（见下「跨工作站改派」）。
   issue 指派给哪个 agent 记在 Ticket 状态的 `agentId` 里，回报作者校验与 `trigger_outcomes` 检查都以它为准。
 - 全部候选不健康：Ticket 的 Assignment 停在 pending（不建 issue），Executor 以 `progress` 回报挂一个待人工决定
@@ -275,7 +284,7 @@ daemon_id 是机器级的，存在 `~/.multica/daemon.id`，CLI daemon 与桌面
     只看 `error` 类消息（工具输出等属于 Worker 的工作，不看），匹配 `not logged in`、`login required`、`unauthorized`、`invalid api key`、`command not found` 等。其余失败照旧记为 Worker 的 `failed`。
   - 改派顺序：先取消 issue 的活跃 run，再 `PUT /api/issues/<id>` 改指派（`assignee_type: agent`、`suppress_run: true`；Multica 改指派不取消已有 run，所以必须先取消），
     然后在同一事务里清掉 Ticket 状态里的 `assignment`、把 `agentId` 换成新 agent（旧 agent 已有的评论记为 seen），并由 Engine 的 `assignmentReassigned` 以 `reassigned` 结束旧 Assignment、开新 Assignment
-    （先收到一条说明改派原因、要求先拉分支读评论的 Input）。新 Assignment 照常启动：在**同一个 issue** 上发 `laterAssignmentComment`（注明从别的工作站移来），
+    （先收到一条说明改派原因、要求先拉分支读评论的 Input）。新 Assignment 照常启动：在**同一个 issue** 上发 `laterAssignmentComment`（注明已改派、现由哪个 agent 运行），
     评论起新 agent 的 run。issue 不变，`superagent_ticket` metadata 照样反查到 Ticket。
   - 旧 Assignment 的回报一律拒收：旧 agent 的评论不再读（作者校验以 `agentId` 为准），新 Assignment 换了 nonce。先取消后改派；之后每次对账还会取消
     issue 上不属于当前 agent 的活跃 run（如改派后 Multica 才为旧 agent 生成的 `deferred` 重试，run 带 `agent_id`），所以不会有两个活跃 run。
@@ -284,7 +293,11 @@ daemon_id 是机器级的，存在 `~/.multica/daemon.id`，CLI daemon 与桌面
   - 改派的决定在第一步之前存进状态 `reassigning`（带它针对的 Assignment，人重试后的新 Assignment 不沿用）；取消或改指派失败、或中途崩溃时
     记在 `worker` 健康项，下次对账（事件、计时器或重连后的补齐）再做。
   - 已知局限：未认领时长用服务端的 `created_at` 对本机时钟，两边时钟偏差会让阈值早到或晚到；健康 agent 因并发已满让 run 排队超过 5 分钟也会被改派；
-    因不可重试的失败被暂停的原候选，暂停到期后不会自动重新考虑（只找“其他”候选），若其他候选一直不在线，Ticket 停在问人那一步，靠人重试。
+    ~~因不可重试的失败被暂停的原候选，暂停到期后不会自动重新考虑~~（#18 已修）：暂停时挂一个 30 分钟的计时器，到期重取一次健康快照，
+    重新考虑等候选的 Ticket（新 Ticket 照常派发；停在问人那一步的 issue 重新对账）。若仍没有其他健康候选，而这次改派正是因原候选的致命失败（`reassigning.fatal`），
+    且原候选现在健康，就回到原候选：同一个 agent 上开新 Assignment（Engine 照样 `assignmentReassigned`，Input 说明它被暂停过、为何重新开始），撤下问题。
+    每个 Ticket 只回原候选一次（状态里的 `returnedTo`，改派到别的 agent 时清掉）：回去后又以同样的致命失败结束，就停在问人那一步，不会每 30 分钟耗一个 Assignment。
+    因未认领 / 掉线改派的不回原候选（它的 run 仍排着，原工作站回来自会认领）。暂停只在本实例内存里，重启即失效，到期计时器也随之不再需要。
   - **实测（2026-11-06，`scripts/multica-drill/reassign.ts`，JAR-79）**：脚本跑真实的 MulticaExecutor（真实 API、事件流、时钟），只把 Engine 与存储换成记录用的替身。
     候选依次为 `failover-test-jxccs`（jxccs，Opencode）与新建探针 `failover-test-jaredai`（JaredAI，Opencode）。`kill -STOP` 冻结 jxccs 的 CLI 与桌面端两个 daemon 后立刻建 Ticket，
     此时 runtime 还显示 online，issue 派给 jxccs。时间线（UTC）：
@@ -425,7 +438,8 @@ PR #8 的作者与提交作者都是 `jaredwtt1203`。
    通知回看范围（游标前 10 分钟）；有意不无条件放开，免得一个开了很久的 Issue 第一次通知时把旧正文送进 gate。
 2. **关 issue 时附的评论会唤醒已结束的 Ticket**（#17，wontfix）：关 #21 时附的说明被当成人的新消息，Ticket 恢复、在 jxccs 多跑一个 run 后报 `dropped`。
    这是上游 core 的设计（`src/core/intake.ts`：人的消息恢复已结束的 Ticket），不改。**操作约定：关 issue 不附评论；要说明，先评论、等 Ticket 处理完再关。**
-3. 其余记在 #18：Worker 自行改正被拒回报后 `worker` 健康项仍停在 `error`（重启才清掉）；`ready` 后关 issue 让收尾中的 run 记为 `cancelled`；致命失败暂停到期后不重新考虑原候选。
+3. 其余记在 #18（已修，见第 8 节「回报被拒的反馈」「Ticket 结束时关闭 issue」「跨工作站改派」）：Worker 自行改正被拒回报后 `worker` 健康项仍停在 `error`（重启才清掉）；
+   `ready` 后关 issue 让收尾中的 run 记为 `cancelled`；致命失败暂停到期后不重新考虑原候选。
 
 ## 8.3 steer 投递路径（#6）
 

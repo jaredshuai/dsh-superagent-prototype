@@ -63,7 +63,8 @@ function setup(initial: Ticket, options: { agents?: string[]; pickHealthy?: bool
     report: vi.fn(() => ticket), reply: vi.fn(() => ({ id: 'r', status: 'sent', reused: false })), handback: vi.fn(() => true),
     followForContext: vi.fn(() => true), markUnrelated: vi.fn(),
   }
-  const health = { get: vi.fn(), set: vi.fn(), release: vi.fn() }
+  let healthNow: { state: string; detail?: string } | undefined
+  const health = { get: vi.fn(() => healthNow), set: vi.fn((next: { state: string; detail?: string }) => { healthNow = next }), release: vi.fn() }
   const api = {
     createIssue: vi.fn(async () => ({ id: 'issue-1', identifier: 'JAR-1' })),
     setMetadata: vi.fn(async () => {}),
@@ -387,12 +388,13 @@ describe('MulticaExecutor', () => {
   })
 
   describe('closing the issue when its ticket ends (#9)', () => {
-    async function ending(outcome: TicketOutcome) {
+    /** A ticket that ended with a run of its issue still `r1Status`, such as a run queued after its last report. */
+    async function ending(outcome: TicketOutcome, { by = 'executor', r1Status = 'queued' }: { by?: 'executor' | 'human'; r1Status?: string } = {}) {
       const h = setup(ticketWith([{ state: 'pending' }]))
       await h.launch()
       h.setTicket(ticketWith([{}]))
-      h.runs.push({ id: 'r1', status: 'running' }, { id: 'r0', status: 'completed' })
-      const ended = ticketWith([{ state: 'ended' }], { ended: { at: '2026-11-05T01:00:00Z', by: 'executor', outcome } } as Partial<Ticket>)
+      h.runs.push({ id: 'r1', status: r1Status }, { id: 'r0', status: 'completed' })
+      const ended = ticketWith([{ state: 'ended' }], { ended: { at: '2026-11-05T01:00:00Z', by, outcome } } as Partial<Ticket>)
       h.setTicket(ended)
       return { h, stop: () => { h.executor.stop(ended, ended.assignments[0]!, outcome) } }
     }
@@ -405,6 +407,38 @@ describe('MulticaExecutor', () => {
         expect(h.api.cancelRun.mock.invocationCallOrder[0]).toBeLessThan(h.api.setStatus.mock.invocationCallOrder[0]!)
         expect(h.state()!.cancelled).toContain('r1')
       })
+    it('lets the running run of a ticket its worker ended finish before closing the issue, as after `ready` (#18)', async () => {
+      const { h, stop } = await ending('completed', { r1Status: 'running' })
+      await h.connect()
+      stop()
+      await settle()
+      expect(h.api.cancelRun).not.toHaveBeenCalled()
+      expect(h.api.setStatus).not.toHaveBeenCalled()
+      h.runs[0]!.status = 'completed'
+      await h.push({ type: 'task:completed', payload: { issue_id: 'issue-1' } })
+      expect(h.api.setStatus).toHaveBeenCalledWith('issue-1', 'done')
+      expect(h.api.cancelRun).not.toHaveBeenCalled()
+    })
+    it('cancels the run still running once the grace after the worker ended its ticket is over, also after a restart', async () => {
+      const { h, stop } = await ending('completed', { r1Status: 'running' })
+      stop()
+      await settle()
+      expect(h.api.setStatus).not.toHaveBeenCalled()
+      await h.advance(60_000)
+      expect(h.api.cancelRun).not.toHaveBeenCalled()
+      h.restart()
+      await h.connect()
+      expect(h.api.setStatus).not.toHaveBeenCalled()
+      await h.advance(60_000)
+      expect(h.api.cancelRun).toHaveBeenCalledWith('r1')
+      expect(h.api.setStatus).toHaveBeenCalledWith('issue-1', 'done')
+    })
+    it('cancels the running run at once when a person stopped the ticket', async () => {
+      const { h, stop } = await ending('stopped', { by: 'human', r1Status: 'running' })
+      stop()
+      await vi.waitFor(() => { expect(h.api.setStatus).toHaveBeenCalledWith('issue-1', 'cancelled') })
+      expect(h.api.cancelRun).toHaveBeenCalledWith('r1')
+    })
     it('closes an issue whose ticket ended while Multica was still creating it', async () => {
       const h = setup(ticketWith([{ state: 'pending' }]))
       const ended = ticketWith([{ state: 'ended' }], { ended: { at: '2026-11-05T01:00:00Z', by: 'human', outcome: 'stopped' } } as Partial<Ticket>)
@@ -620,6 +654,37 @@ describe('MulticaExecutor', () => {
       other.h.runs[1]!.status = 'completed'
       await other.h.executor.reconcile('t1')
       expect(retries(other.h)).toHaveLength(1)
+    })
+
+    it('clears the worker health error of a refused report once a later report of the assignment is accepted (#18)', async () => {
+      const { h, nonce } = await running()
+      // JAR-84: a `dropped` report without a summary, refused, then sent again in full 14 seconds later.
+      h.comments.push(agentComment('k1', report({ tool: 'report', state: 'dropped' }, nonce)))
+      await h.executor.reconcile('t1')
+      expect(h.health.get()).toMatchObject({ state: 'error', detail: expect.stringContaining('Ignored a report block in comment k1') })
+      h.comments.push(agentComment('k2', report({ tool: 'report', state: 'dropped', summary: 'Nothing to do' }, nonce)))
+      await h.executor.reconcile('t1')
+      expect(h.health.get()).toMatchObject({ state: 'ready' })
+    })
+
+    it('keeps the health error of a refused ack, which a later report does not fix', async () => {
+      const { h, nonce } = await running()
+      h.engine.reply.mockImplementationOnce(() => { throw new Error('No such trigger') })
+      h.comments.push(agentComment('k1', report({ tool: 'ack', trigger_id: 'made-up', text: 'on it' }, nonce)))
+      await h.executor.reconcile('t1')
+      h.comments.push(agentComment('k2', report({ tool: 'report', state: 'progress', summary: 'working' }, nonce)))
+      await h.executor.reconcile('t1')
+      expect(h.health.get()).toMatchObject({ state: 'error', detail: expect.stringContaining('comment k1') })
+    })
+
+    it('keeps a health error that is not the refusal when a later report is accepted', async () => {
+      const { h, nonce } = await running()
+      h.comments.push(agentComment('k1', report({ tool: 'report', state: 'dropped' }, nonce)))
+      await h.executor.reconcile('t1')
+      h.health.set({ state: 'error', detail: 'Multica event stream: closed; reconnecting' })
+      h.comments.push(agentComment('k2', report({ tool: 'report', state: 'dropped', summary: 'Nothing to do' }, nonce)))
+      await h.executor.reconcile('t1')
+      expect(h.health.get()).toMatchObject({ state: 'error', detail: expect.stringContaining('reconnecting') })
     })
 
     it('does not answer report blocks in comments the configured agent did not write', async () => {
@@ -841,6 +906,53 @@ describe('MulticaExecutor', () => {
         await h.executor.reconcile('t1')
         expect(h.api.assignIssue).toHaveBeenCalledTimes(1)
         expect(h.engine.report).toHaveBeenCalledWith('t1', expect.objectContaining({ question: expect.stringContaining('No Multica workstation') }))
+      })
+
+      it('starts the ticket again on its suspended candidate once the suspension is over, when no other is online (#18)', async () => {
+        const h = await launched()
+        h.agents.find(agent => agent.id === 'a-ok-2')!.status = 'offline'
+        await h.push({ type: 'agent:status', payload: {} })
+        h.runs.push({ id: 'r1', status: 'failed', created_at: h.at(), failure_reason: 'agent_error.provider_auth_or_access' } as Run)
+        await h.executor.reconcile('t1')
+        expect(h.engine.report).toHaveBeenCalledWith('t1', expect.objectContaining({ question: expect.stringContaining('No Multica workstation') }))
+        await h.advance(29 * MINUTE)
+        expect(h.engine.assignmentReassigned).not.toHaveBeenCalled()
+        // A person fixed the login meanwhile; the suspension ends and the ticket goes back to a-ok, with nobody asked to retry.
+        await h.advance(1 * MINUTE)
+        expect(h.api.assignIssue).toHaveBeenCalledWith('issue-1', 'a-ok')
+        expect(h.engine.assignmentReassigned).toHaveBeenCalledExactlyOnceWith('t1', 'a1', expect.stringContaining('a-ok'))
+        expect(h.engine.report).toHaveBeenLastCalledWith('t1', expect.objectContaining({ question: null }))
+        await relaunch(h)
+        expect(h.state()).toMatchObject({ agentId: 'a-ok', assignment: { id: 'a2' } })
+        expect(h.posted.at(-1)!.content).toContain('A new assignment `a2`')
+      })
+
+      it('goes back to its suspended candidate once, not every time its suspension ends', async () => {
+        const h = await launched()
+        h.agents.find(agent => agent.id === 'a-ok-2')!.status = 'offline'
+        await h.push({ type: 'agent:status', payload: {} })
+        h.runs.push({ id: 'r1', status: 'failed', created_at: h.at(), failure_reason: 'agent_error.provider_auth_or_access' } as Run)
+        await h.executor.reconcile('t1')
+        await h.advance(30 * MINUTE)
+        await relaunch(h)
+        // Still logged out: the second suspension leaves the ticket to a person.
+        h.runs.push({ id: 'r2', status: 'failed', created_at: h.at(), failure_reason: 'agent_error.provider_auth_or_access' } as Run)
+        await h.executor.reconcile('t1')
+        await h.advance(30 * MINUTE)
+        expect(h.engine.assignmentReassigned).toHaveBeenCalledTimes(1)
+        expect(h.engine.report).toHaveBeenLastCalledWith('t1', expect.objectContaining({ question: expect.stringContaining('No Multica workstation') }))
+      })
+
+      it('does not start a ticket again on its own candidate whose run went unclaimed', async () => {
+        const h = await launched()
+        h.agents.find(agent => agent.id === 'a-ok-2')!.status = 'offline'
+        await h.push({ type: 'agent:status', payload: {} })
+        h.runs.push({ id: 'r1', status: 'queued', created_at: h.at() } as Run)
+        await h.executor.reconcile('t1')
+        await h.advance(40 * MINUTE)
+        await h.push({ type: 'agent:status', payload: {} })
+        expect(h.engine.assignmentReassigned).not.toHaveBeenCalled()
+        expect(h.api.cancelRun).not.toHaveBeenCalled()
       })
 
       it('cancels a retry Multica deferred for the old agent after the issue was reassigned', async () => {
