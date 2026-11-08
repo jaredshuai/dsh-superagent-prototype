@@ -405,6 +405,28 @@ PR #8 的作者与提交作者都是 `jaredwtt1203`。
 
 **还没验证**：重启中的 run 正常结束（那个 run 因 jxccs 上 opencode 免费额度用完而 failed，但重启本身没有打断它）。
 
+### 8.2.1 双候选部署与冒烟（2026-11-08，#8、#16）
+
+**部署**：服务器拉到 `c3f9123`（含 #8 改派与 #9、#13、#14），`pnpm build` 后改 `MULTICA_AGENT_IDS=<superagent-worker-jxccs-codebuddy>,<superagent-worker-jaredai-mcode>`
+（jxccs 优先，JaredAI 候补；改前备份了环境文件），重启。之后 #16 的修复（`107efaa`）同样拉取、构建、重启。
+
+**冒烟（superagent-sandbox，UTC）**：
+
+| issue | 时间线 | 结果 |
+| --- | --- | --- |
+| #21 → JAR-84 | 14:39:43 开 issue；14:40:46 Ticket 建立、确认回复；14:41:19 `ready` | jxccs 正常派发 |
+| #22 → JAR-85 | 15:00:21 冻结 jxccs 两个 daemon；15:01:22 Ticket 建立（指派 jxccs）；15:06:27 5 分钟未认领，改派 JaredAI、取消 jxccs 的 run、解冻；15:10:25 `ready` | **线上改派**跑通，在 JaredAI 完成 |
+| #23 → Ticket | 15:28:49 开 issue（只在正文 @）；15:29:52 确认回复；15:30:22 `ready` | #16 修复后正文 @ 直接建票 |
+
+**发现**：
+
+1. **新开 Issue 正文的 @ 被漏掉**（#16，已修）：#22 第一次没建票。14:46:03 开 issue，通知 14:46:26 才被打上时间、晚一轮列出；那一轮的游标 ≈ 14:46:26，
+   通知不算“晚到”，Issue 从游标读，`created_at` 早于游标，正文被当成已读。修法：Issue / PR 首次被读（无 `github-cursor:<n>`）时，正文按“新开”算的下限放宽到
+   通知回看范围（游标前 10 分钟）；有意不无条件放开，免得一个开了很久的 Issue 第一次通知时把旧正文送进 gate。
+2. **关 issue 时附的评论会唤醒已结束的 Ticket**（#17，wontfix）：关 #21 时附的说明被当成人的新消息，Ticket 恢复、在 jxccs 多跑一个 run 后报 `dropped`。
+   这是上游 core 的设计（`src/core/intake.ts`：人的消息恢复已结束的 Ticket），不改。**操作约定：关 issue 不附评论；要说明，先评论、等 Ticket 处理完再关。**
+3. 其余记在 #18：Worker 自行改正被拒回报后 `worker` 健康项仍停在 `error`（重启才清掉）；`ready` 后关 issue 让收尾中的 run 记为 `cancelled`；致命失败暂停到期后不重新考虑原候选。
+
 ## 8.3 steer 投递路径（#6）
 
 **源码结论（multica `3a0fed5`，`server/internal/handler/comment.go`、`task_supplement.go`、`daemon.go`、`pkg/db/queries/supplement.sql`、`comment.sql`）：**
