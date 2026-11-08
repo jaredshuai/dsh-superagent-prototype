@@ -430,6 +430,7 @@ PR #8 的作者与提交作者都是 `jaredwtt1203`。
 | #21 → JAR-84 | 14:39:43 开 issue；14:40:46 Ticket 建立、确认回复；14:41:19 `ready` | jxccs 正常派发 |
 | #22 → JAR-85 | 15:00:21 冻结 jxccs 两个 daemon；15:01:22 Ticket 建立（指派 jxccs）；15:06:27 5 分钟未认领，改派 JaredAI、取消 jxccs 的 run、解冻；15:10:25 `ready` | **线上改派**跑通，在 JaredAI 完成 |
 | #23 → Ticket | 15:28:49 开 issue（只在正文 @）；15:29:52 确认回复；15:30:22 `ready` | #16 修复后正文 @ 直接建票 |
+| #24 → JAR-87 | 部署 `88f7123`（#18）后。16:16:46 Ticket 建立、确认回复；16:17:17 `ready`，Worker 按要求回报后在同一 run 里 `sleep 30` 再列评论；16:17:57 run 自行结束 | run 记为 **`completed`**（#21、#22 是 `cancelled`），之后 issue 才关成 `done`；`worker` 全程 `ready` |
 
 **发现**：
 
@@ -438,7 +439,7 @@ PR #8 的作者与提交作者都是 `jaredwtt1203`。
    通知回看范围（游标前 10 分钟）；有意不无条件放开，免得一个开了很久的 Issue 第一次通知时把旧正文送进 gate。
 2. **关 issue 时附的评论会唤醒已结束的 Ticket**（#17，wontfix）：关 #21 时附的说明被当成人的新消息，Ticket 恢复、在 jxccs 多跑一个 run 后报 `dropped`。
    这是上游 core 的设计（`src/core/intake.ts`：人的消息恢复已结束的 Ticket），不改。**操作约定：关 issue 不附评论；要说明，先评论、等 Ticket 处理完再关。**
-3. 其余记在 #18（已修，见第 8 节「回报被拒的反馈」「Ticket 结束时关闭 issue」「跨工作站改派」）：Worker 自行改正被拒回报后 `worker` 健康项仍停在 `error`（重启才清掉）；
+3. 其余记在 #18（已修，#24 线上验证了关闭宽限；见第 8 节「回报被拒的反馈」「Ticket 结束时关闭 issue」「跨工作站改派」）：Worker 自行改正被拒回报后 `worker` 健康项仍停在 `error`（重启才清掉）；
    `ready` 后关 issue 让收尾中的 run 记为 `cancelled`；致命失败暂停到期后不重新考虑原候选。
 
 ## 8.3 steer 投递路径（#6）
