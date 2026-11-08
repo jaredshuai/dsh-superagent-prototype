@@ -355,16 +355,21 @@ async function pollNotifications(ctx: SourceContext, round: Round): Promise<{ co
 }
 async function readNotified(ctx: SourceContext, round: Round, number: number, item: Retry): Promise<void> {
   const { since } = item
+  // GitHub stamps and lists the notification some time after the Issue or PR is opened, so on its first read the cursor may
+  // already have passed its opening: the body then counts as newly opened back to the notification look-back, not only to the
+  // cursor. Bounded by that look-back so the first notification on a long-open Issue does not bring its old body in.
+  const firstRead = ctx.state.get(KV.github.cursor(number)) === undefined
+  const openedFrom = Date.parse(since) - (firstRead ? NOTIFICATION_LAG_MS : 0)
+  const { login } = ctx.deployment.github
   let isPr = item.pr
   if (!isPr) {
     const issue = await ctx.commands.withSignal(round.signal).api(IssueSchema, `issues/${number}`)
     // `issues/<n>` also returns PRs with `pull_request` set; handle them in the PR branch below.
     isPr = !!issue.pull_request
     if (!isPr) {
-      // An Issue opened by someone other than the agent since the cursor brings its body so a mention in it reaches the gate.
+      // An Issue opened by someone other than the agent since `openedFrom` brings its body so a mention in it reaches the gate.
       // A mention added by a later edit to the body is not read: only the author can be the actor of the body.
-      const { login } = ctx.deployment.github
-      const opened = Date.parse(issue.created_at) >= Date.parse(since) && !sameName(issue.user.login, login)
+      const opened = Date.parse(issue.created_at) >= openedFrom && !sameName(issue.user.login, login)
       if (opened) await ctx.receive(issueTrigger(issue, login))
       await intakeComments(ctx, { number, isPr: false, url: issue.html_url }, since, round)
       nameThread(ctx, number, issue.title)
@@ -372,9 +377,8 @@ async function readNotified(ctx: SourceContext, round: Round, number: number, it
   }
   if (isPr) {
     const pr = await pull(ctx, round, number)
-    // Emit a PR description trigger for PRs opened since the cursor; its ID is the same as the one produced by the repository PR stream.
-    const { login } = ctx.deployment.github
-    if (pr.created_at && Date.parse(pr.created_at) >= Date.parse(since) && !sameName(pr.user.login, login)) {
+    // Emit a PR description trigger for PRs opened since `openedFrom`; its ID is the same as the one produced by the repository PR stream.
+    if (pr.created_at && Date.parse(pr.created_at) >= openedFrom && !sameName(pr.user.login, login)) {
       const opened = { number, title: pr.title ?? '', body: pr.body, user: pr.user, created_at: pr.created_at, html_url: pr.html_url }
       await ctx.receive(pullTrigger(opened, login))
     }

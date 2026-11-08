@@ -595,6 +595,52 @@ describe('github source', () => {
     expect(bare(reads).filter(path => path === 'issues/20')).toHaveLength(1)
     h.store.close()
   })
+  // Live, 2026-11-08 (#16): Issue #22 opened 14:46:03, its notification stamped 14:46:26 and first listed in the round after,
+  // whose cursor (previous start − 5 s) was ≈ 14:46:26. So: opened 23 s before the cursor, notification stamped just after it.
+  const openedBeforeCursor = (cursor: string) => new Date(Date.parse(cursor) - 23_000).toISOString()
+  const stampedAfterCursor = (cursor: string) => new Date(Date.parse(cursor) + 500).toISOString()
+  /** A host whose first round has run with nothing notified, so its cursor is set; returns the routes to fill and that cursor. */
+  async function afterFirstRound() {
+    const h = host()
+    h.store.set('github-since', new Date(Date.now() - 120_000).toISOString())
+    const routes: Record<string, unknown> = { notifications: [] }
+    github(h, routes)
+    await pollRound(h)
+    return { h, routes, cursor: h.store.get<string>('github-since')! }
+  }
+  it('takes the body of an Issue opened before the cursor when its notification, stamped after the cursor, is its first read', async () => {
+    const { h, routes, cursor } = await afterFirstRound()
+    Object.assign(routes, { notifications: [{ ...notification(22), updated_at: stampedAfterCursor(cursor) }],
+      'issues/22': issue(22, { created_at: openedBeforeCursor(cursor), body: '@agent-bot add a file' }) })
+    await pollRound(h)
+    expect(h.receive.mock.calls.map(([trigger]) => trigger.meta.number)).toEqual([22])
+    h.store.close()
+  })
+  it('takes the description of a PR opened before the cursor when its notification is its first read', async () => {
+    const { h, routes, cursor } = await afterFirstRound()
+    Object.assign(routes, { notifications: [{ ...notification(23, 'pulls'), updated_at: stampedAfterCursor(cursor) }],
+      'pulls/23': { ...openPull(23), body: '@agent-bot please review', created_at: openedBeforeCursor(cursor) } })
+    await pollRound(h)
+    expect(h.receive.mock.calls.map(([trigger]) => trigger.meta.number)).toEqual([23])
+    h.store.close()
+  })
+  it('does not take again the body of an Issue opened before the cursor that an earlier round already read', async () => {
+    const { h, routes, cursor } = await afterFirstRound()
+    h.store.set('github-cursor:24', cursor)
+    Object.assign(routes, { notifications: [{ ...notification(24), updated_at: stampedAfterCursor(cursor) }],
+      'issues/24': issue(24, { created_at: openedBeforeCursor(cursor), body: '@agent-bot add a file' }) })
+    await pollRound(h)
+    expect(h.receive).not.toHaveBeenCalled()
+    h.store.close()
+  })
+  it('does not take the body of a long-open Issue on its first notification', async () => {
+    const { h, routes, cursor } = await afterFirstRound()
+    Object.assign(routes, { notifications: [{ ...notification(25), updated_at: stampedAfterCursor(cursor) }],
+      'issues/25': issue(25, { created_at: new Date(Date.parse(cursor) - 3_600_000).toISOString(), body: '@agent-bot add a file' }) })
+    await pollRound(h)
+    expect(h.receive).not.toHaveBeenCalled()
+    h.store.close()
+  })
   it('reads each notified Issue alone and reads a failed one again next round, from where it was', async () => {
     const h = host()
     h.store.set('github-since', '2026-09-08T00:00:00.000Z')
