@@ -137,6 +137,13 @@ daemon_id 是机器级的，存在 `~/.multica/daemon.id`，CLI daemon 与桌面
   用法：Worker 的所有 git 命令用 `git-agent`，所有 gh 命令用 `gh-agent`。两者都在 Multica run 的 `PATH` 上（daemon 注入的 PATH 含 `~/.local/bin`）。
   执行用的 Multica agent 是 `superagent-worker-jxccs`（Opencode runtime），说明里写了上述规则；`failover-test-jxccs` 只是环境探针，不接真实工作。
   实测 JAR-52：run 推送分支、开 PR，PR 作者、提交作者（已关联账号）和推送者都是 `jaredwtt1203`；探针 PR 与分支已清理。
+- **JaredAI 已配置（2026-11-08，第二候选工作站）**：Windows 11，run 在 PowerShell 7 下执行（探针 JAR-81）；操作者的 gh 登录在 Windows 凭据库、全局 git 凭据走 `manager`。
+  包装是 `C:\Users\jared\.local\bin\gh-agent.cmd` 与 `git-agent.cmd`（在 run 的 `PATH` 上），做法同上：清掉 `GH_TOKEN`/`GITHUB_TOKEN`、`GH_CONFIG_DIR` 指向
+  `~\.config\gh-agent`、git 凭据助手先清空再走 `gh auth git-credential`、SSH 地址改写为 HTTPS、提交作者为 `jaredwtt1203`；另设 `GCM_INTERACTIVE=never`。
+  不用传文件：包装由 worker 在 run 里按 issue 描述写入（JAR-82），登录用 GitHub 设备码——run 后台起 `gh-agent auth login --web --insecure-storage`，
+  把一次性码发到 issue 评论，操作者在任意设备以 `jaredwtt1203` 打开 `github.com/login/device` 输入。token 只落在 JaredAI 的 `~\.config\gh-agent\hosts.yml`，
+  不经评论、不进 Windows 凭据库，操作者的登录与全局 git 配置不变。执行用的 agent 是 `superagent-worker-jaredai-mcode`（MiniMax Code runtime；
+  该机 opencode 未登录，见上「跨工作站改派」实测）。实测 JAR-83 / sandbox PR #20：PR 作者、提交作者（已关联账号）和推送者都是 `jaredwtt1203`；探针 PR 与分支已清理。
 - Multica token 只在云端；工作站只拿到每 Assignment 的签名密钥，不拿任何云端凭据。
 
 ## 6. 去轮询：推送优先 + 断线补齐
