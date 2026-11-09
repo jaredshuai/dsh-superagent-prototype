@@ -1,3 +1,7 @@
+## 禁止触碰上游
+
+**禁止向上游 `deepseek-ai/dsh-superagent-prototype` 发 issue、开 PR、评论或推送**，包括为了「回馈修复」「减少同步冲突」。所有改动只留在本 fork（`jaredshuai/dsh-superagent-prototype`）。`upstream` remote 只用于 `git fetch` 同步。见 [ADR 0005](docs/adr/0005-isolate-fork-changes.md)。
+
 ## Agent skills
 
 ### Issue tracker

@@ -398,7 +398,7 @@ PR #8 的作者与提交作者都是 `jaredwtt1203`。
 
 **发现的缺陷（均已修，带测试）**：
 
-1. **GitHub 通知晚到被游标越过**（`src/sources/github.ts`、`src/kv.ts`，上游代码，与 Multica 无关，偏离 ADR 0005 的「只改 multica*.ts」，应回馈上游，#11）：通知的 `updated_at` 是 11:38:48，但 GitHub 列出它晚于下一轮游标
+1. **GitHub 通知晚到被游标越过**（`src/sources/github.ts`、`src/kv.ts`，上游代码，与 Multica 无关，偏离 ADR 0005 的「只改 multica*.ts」，只留在 fork、不回馈上游）：通知的 `updated_at` 是 11:38:48，但 GitHub 列出它晚于下一轮游标
    （轮次开始 − 5 s），之后 `since=` 再也取不到。修法：列表比游标往前多取 10 分钟，晚到的通知从那里读；窗口内已处理的通知按 id + `updated_at`
    记在 `github-notified`，原样再出现不重读。
 2. **投递被误判为失败而循环重发**（`multica-protocol.ts` `refusedOutcome`）：Multica 的 `trigger_outcomes` 只列评论里**显式 @** 的 agent
@@ -407,7 +407,7 @@ PR #8 的作者与提交作者都是 `jaredwtt1203`。
 3. **对账会自动重投递已失败的投递**：真被 `blocked` 时，每个 `comment:created` 事件都会再发一条评论。修法：Ticket 带投递错误时对账不再投递。网络类失败仍由 effect 队列退避重试（成功即清掉错误）；被 Multica 明确拒收的投递要等下一条 Input、新 Assignment 或 Ticket 结束才再投。
 4. **同一 Ticket 的两次投递并发**（11:56:48 两条相同评论）：Engine 与对账各排了一次投递。修法：每个 Ticket 的投递串行执行。
 
-5. **改了环境文件、用 login shell 重启，服务仍拿旧变量**（`scripts/dsh-superagent`，上游代码，应回馈上游，#11）：tmux 会话还在时脚本开新窗口，窗口继承的是
+5. **改了环境文件、用 login shell 重启，服务仍拿旧变量**（`scripts/dsh-superagent`，上游代码，只留在 fork、不回馈上游）：tmux 会话还在时脚本开新窗口，窗口继承的是
    早已在跑的 tmux server 的全局环境，不是执行 `restart` 的 shell 的。修法：`start` 把自己的环境写成控制目录下 0600 的快照，窗口里的启动器读入、
    删除后 `execve` 成 dsh；PID 不变，值不上命令行，tmux 启动失败时快照也删掉。
 6. **同标题的活跃 issue 让建 issue 失败**（`multica-api.ts`）：被停掉的 Ticket 的 issue 仍是 `todo`，Multica 拒绝再建同标题的活跃 issue（409

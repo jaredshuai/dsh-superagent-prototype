@@ -4,6 +4,8 @@ Issues and specs for this repo live as GitHub issues on **`jaredshuai/dsh-supera
 
 > **Always pass `-R jaredshuai/dsh-superagent-prototype`** (or run `gh repo set-default jaredshuai/dsh-superagent-prototype`). Without it `gh` resolves to the `upstream` remote (`deepseek-ai/dsh-superagent-prototype`), which must never receive issues or labels from this repo.
 
+> **Never open issues, pull requests or comments on the upstream `deepseek-ai/dsh-superagent-prototype`, and never push to it** — not even to contribute a fix back. Every change stays in this fork; `upstream` is fetch-only. See `AGENTS.md` and ADR 0005.
+
 ## Conventions
 
 - **Create an issue**: `gh issue create --title "..." --body "..."`. Use a heredoc for multi-line bodies.
