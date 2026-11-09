@@ -76,6 +76,9 @@ const engine: MulticaExecutorHost['engine'] = {
   deliveryFailed: (_ticket, id, why) => { log('engine', `deliveryFailed ${id}: ${why}`) },
   report: (_ticket, report) => {
     log('engine', `report ${JSON.stringify(report)}`)
+    // As the Engine does, a question stays on the ticket until a report clears it, so the executor can withdraw its own.
+    if (report.question) ticket = { ...ticket, attention: { id: 'drill-attention', question: report.question } } as Ticket
+    else if (report.question === null) { const { attention: _, ...rest } = ticket; ticket = rest as Ticket }
     if (report.state === 'ready' || report.state === 'failed') finish(report.state)
     return ticket
   },

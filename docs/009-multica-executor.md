@@ -313,8 +313,16 @@ daemon_id 是机器级的，存在 `~/.multica/daemon.id`，CLI daemon 与桌面
       10:46:09（5 分 1 秒）改派，旧 run 取消；JaredAI 的 run 4 s 后 running，10:47:11 `ack`、10:47:27 `ready`（"drill: ran on JAREDAI"）。
       解冻后 jxccs 回到 online，issue 上只有 2 个 run（jxccs cancelled、JaredAI completed），旧 agent 没有再起 run。即：一台工作站离线，Ticket 在另一台跑完。
     - 替身的局限：问题由 `ticket.attention` 判断是否还挂着，替身 Engine 不设 attention，所以改派成功后的 `question: null` 撤下没有在演练里出现（单测覆盖）。
+      （#19 起替身按回报的 `question` 设、清 `attention`，撤下问题也会出现在日志里。）
     - 结论：5 分钟阈值、取消后改派、按错误文本判不可重试、全部离线时问人、恢复后自动改派这几条在真实环境里都按设计工作。尚未实测的是「run 执行中整机掉线、Multica 以 `runtime_offline` 判失败」：
       它要等重连宽限期，路径与上面的失败分类相同。
+  - **实测：暂停到期后回到原候选（2026-11-09，#19，JAR-88，`88f7123`）**：同一个脚本，`--timeout 4200`。候选依次为 B = `failover-test-jaredai`（JaredAI，Opencode，演练前从归档恢复）
+    与 A = `failover-test-jaredai-mcode`（已归档，永远不健康，代替一台离线工作站，不用冻结任何 daemon）。时间线（UTC）：
+    - 01:31:50 建 issue、派给 B；01:32:12 run 失败，`failure_reason` 为 `agent_error.provider_quota_limit`（opencode 免费额度用完，不可重试）⇒ 暂停 B、存下 `reassigning`（`fatal`），没有其他健康候选，问人一次。
+    - 02:02:15（暂停到期后 3 s）重取快照、重新对账 ⇒ `question: null` 撤下问题，`assignmentReassigned` a1 → a2，Input 为「This ticket starts again on Multica agent B, which was kept out for 30 minutes because …」；
+      02:02:16 同一 issue 上的新 run 被认领。
+    - 02:02:48 a2 的 run 同样因额度失败 ⇒ 再次暂停、再问一次人。02:32:49 第二次暂停到期后直到 02:41:46 脚本超时，没有任何改派或新 run：`returnedTo` 让每个 Ticket 只回原候选一次。
+    - 事后 issue 上恰好 2 个 run，都是 B 的 failed；issue 手动改为 `cancelled`，B 重新归档。没测「暂停期间修好 B 的 CLI 后回到 B 并 `ready`」：与上面回到 B 的路径相同，只是 run 的结果不同。
 - 重启：远端 run 不受影响，所以 `resume` 不打断 running 的 Assignment，只重新排队 pending 的启动；连接建立后的补齐会追上错过的事件。
 
 **还没做**：
