@@ -323,6 +323,9 @@ daemon_id 是机器级的，存在 `~/.multica/daemon.id`，CLI daemon 与桌面
       02:02:16 同一 issue 上的新 run 被认领。
     - 02:02:48 a2 的 run 同样因额度失败 ⇒ 再次暂停、再问一次人。02:32:49 第二次暂停到期后直到 02:41:46 脚本超时，没有任何改派或新 run：`returnedTo` 让每个 Ticket 只回原候选一次。
     - 事后 issue 上恰好 2 个 run，都是 B 的 failed；issue 手动改为 `cancelled`，B 重新归档。没测「暂停期间修好 B 的 CLI 后回到 B 并 `ready`」：与上面回到 B 的路径相同，只是 run 的结果不同。
+  - 探针现状（2026-11-09）：jxccs 与 JaredAI 上 opencode 都没接 provider，自带免费模型的额度按账号合计已用完（逐个试过 8 个免费模型都报 `Free usage limit reached`）。
+    `failover-test-jxccs` 已改绑到 jxccs 的 Codebuddy runtime（JAR-89 验证 `completed`）；`failover-test-jaredai`（JaredAI Opencode）保持归档，需要稳定的致命失败时恢复它即可，如上面 #19 的演练。
+    `superagent-worker-jxccs-opencode` 未动：它不在 `MULTICA_AGENT_IDS` 里，jxccs 上 Codebuddy / Claude / Codex 已各有 worker。
 - 重启：远端 run 不受影响，所以 `resume` 不打断 running 的 Assignment，只重新排队 pending 的启动；连接建立后的补齐会追上错过的事件。
 
 **还没做**：
