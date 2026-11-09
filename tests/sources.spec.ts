@@ -1116,7 +1116,7 @@ describe('feishu event consumer', () => {
    * and `flaky` exits after its first ready. `events` prints the events file once it exists, and `late` a second after it is ready.
    * It records each run and the PID of the latest.
    */
-  function cli(mode: 'never' | 'warn' | 'ready' | 'flaky' | 'events' | 'late'): string {
+  function cli(mode: 'never' | 'warn' | 'ready' | 'flaky' | 'events' | 'late' | 'early'): string {
     const path = join(dir, 'lark-bot')
     writeFileSync(path, `#!/bin/sh
   [ "$1" = event ] || { echo '{"ok":true,"data":{}}'; exit 0; }
@@ -1128,6 +1128,7 @@ describe('feishu event consumer', () => {
     flaky) echo '[event] ready' >&2; [ "$n" -gt 1 ] && exec sleep 60; exit 1 ;;
     events) echo '[event] ready' >&2; until [ -f '${dir}/events' ]; do sleep 0.05; done; cat '${dir}/events'; touch '${dir}/printed'; exec sleep 60 ;;
     late) echo '[event] ready' >&2; sleep 1; cat '${dir}/events'; touch '${dir}/printed'; exec sleep 60 ;;
+    early) echo 'not json'; until [ -f '${dir}/go' ]; do sleep 0.05; done; echo '[event] ready' >&2; touch '${dir}/printed'; exec sleep 60 ;;
   esac
   `, { mode: 0o755 })
     return path
@@ -1172,6 +1173,17 @@ describe('feishu event consumer', () => {
     await vi.waitFor(() => expect(store.triggers.get(feishuTriggerId('om_3'))).toBeDefined(), until)
     expect(['om_1', 'om_2'].map(id => store.triggers.get(feishuTriggerId(id))?.meta.direct)).toEqual([false, true])
     expect(store.get(KV.feishu.chats)).toEqual({ oc_group: false, oc_dm: true })
+    expect(health.feishu).toMatchObject({ state: 'error', detail: expect.stringContaining('JSON') })
+    controller.abort(); await running; store.close()
+  }, 20_000)
+  it('keeps reporting a malformed line it read before the ready line', async () => {
+    const { ctx, health, store } = consumerSource(cli('early'))
+    running = runFeishu(ctx, controller.signal)
+    await vi.waitFor(() => expect(health.feishu).toMatchObject({ state: 'error', detail: expect.stringContaining('JSON') }), until)
+    writeFileSync(join(dir, 'go'), '')
+    await vi.waitFor(() => expect(existsSync(join(dir, 'printed'))).toBe(true), until)
+    // The ready line is read soon after it is printed; it must not replace the malformed line's report.
+    await new Promise(resolve => setTimeout(resolve, 300))
     expect(health.feishu).toMatchObject({ state: 'error', detail: expect.stringContaining('JSON') })
     controller.abort(); await running; store.close()
   }, 20_000)
