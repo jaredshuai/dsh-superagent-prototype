@@ -171,6 +171,8 @@ const realClock: Clock = {
 }
 const now = () => new Date().toISOString()
 const errorText = (error: unknown) => error instanceof Error ? error.message : String(error)
+/** Marks a Trigger a bot or CI sent, for the worker, which is told not to acknowledge one. */
+const automated = (trigger: Trigger) => trigger.human ? {} : { automated: true }
 /** The run that ended last. */
 const lastEnded = (runs: readonly Run[]): Run | undefined => [...runs].sort((a, b) => (a.completed_at ?? '').localeCompare(b.completed_at ?? '')).at(-1)
 const issueOf = (event: MulticaEvent): string | undefined => {
@@ -283,17 +285,20 @@ export class MulticaExecutor implements Executor {
   private async assignmentText(ticket: Ticket): Promise<string> {
     const source = sourceTrigger(this.host, ticket)
     const card = source ? await this.triggerCard(source) : undefined
-    const batch = batchOf(this.host, ticket).map(trigger => ({ ...batchLine(trigger), text: trigger.text }))
+    const batch = batchOf(this.host, ticket).map(trigger => ({ ...batchLine(trigger), text: trigger.text, ...automated(trigger) }))
     const retried = ticket.assignments.at(-2)?.endedReason === 'retried'
     return JSON.stringify({ ticket_id: ticket.id, title: ticket.title, ...ticket.execution?.assignment ? { assignment: ticket.execution.assignment } : {},
       ...card ? { trigger: card } : {}, ...batch.length ? { batch } : {},
       ...retried ? { note: 'A person retried this ticket. Continue from the branch, its history and the PR state.' } : {} }, null, 2)
   }
-  /** A Trigger as the worker sees it: like a DSH worker's card, but with its full text, since remote workers cannot read resources. */
+  /**
+   * A Trigger as the worker sees it: like a DSH worker's card, but with its full text, since remote workers cannot read
+   * resources, and marked when a bot or CI sent it, since the Engine refuses an acknowledgement of one.
+   */
   private async triggerCard(trigger: Trigger, note?: string): Promise<Record<string, unknown>> {
     const link = await this.host.sourceLink(trigger, this.host.lifetime).catch(() => ({}))
     const { read: _read, chars: _chars, ...card } = triggerMessage(trigger, link, note, this.host.repliedTo(trigger)) as Record<string, unknown>
-    return { ...card, text: trigger.text }
+    return { ...card, text: trigger.text, ...automated(trigger) }
   }
   private brief(ticket: Ticket, assignment: Assignment, nonce: string, text: string): Brief {
     const { repository, instructions } = this.host.config

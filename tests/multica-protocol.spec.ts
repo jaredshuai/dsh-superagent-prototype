@@ -47,6 +47,12 @@ describe('issue description', () => {
     // It comes before the reporting examples, where a worker reads it before it starts.
     expect(text.indexOf(rule!)).toBeLessThan(text.indexOf('```superagent-report'))
   })
+  it('asks for an ack of a person\'s message only, never of one marked automated (#20)', () => {
+    const rule = issueDescription(brief).split('\n').find(line => /`ack`/.test(line) && /before any other step/i.test(line))!
+    expect(rule).toMatch(/each person's message/)
+    expect(rule).toContain('`"automated": true`')
+    expect(rule).toMatch(/never `ack`/)
+  })
   it('makes fresh nonces', () => { expect(newNonce()).not.toBe(newNonce()) })
   it('puts the inputs of one delivery in one comment', () => {
     expect(inputComment(['{"trigger_id":"x"}', 'text'])).toMatch(/```superagent-input\n\{"trigger_id":"x"\}\ntext\n```$/)

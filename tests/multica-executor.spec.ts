@@ -6,8 +6,11 @@ import { MULTICA_KV, MulticaExecutor, type MulticaExecutorHost, type MulticaTick
 import { REPORT_FENCE } from '../src/executor/multica-protocol.ts'
 
 const AGENT = 'agent-1'
-const trigger = { id: 'tr1', text: 'Please fix the README typo', at: '2026-11-05T00:00:00Z', actor: { id: 'jared', source: 'github' },
+const trigger = { id: 'tr1', text: 'Please fix the README typo', at: '2026-11-05T00:00:00Z', actor: { id: 'jared', source: 'github' }, human: true,
   threads: [{ source: 'github', id: '2' }] } as unknown as Trigger
+/** A bot's comment on the ticket's PR, as CodeRabbit's summary on superagent-sandbox PR #26 was (JAR-95). */
+const botTrigger = { id: 'tr2', text: 'Walkthrough: adds a note', at: '2026-11-05T00:02:00Z', actor: { id: 'coderabbitai[bot]', source: 'github' }, human: false,
+  threads: [{ source: 'github', id: '26' }] } as unknown as Trigger
 
 function ticketWith(assignments: Partial<Assignment>[], extra: Partial<Ticket> = {}): Ticket {
   return { id: 't1', title: 'Fix typo', createdAt: '2026-11-05T00:00:00Z', mandate: { strength: 'explicit', basis: {} },
@@ -98,7 +101,7 @@ function setup(initial: Ticket, options: { agents?: string[]; pickHealthy?: bool
     engine, health, api,
     store: {
       tickets: { get: () => ticket, open: () => ticket.ended ? [] : [ticket] },
-      triggers: { get: (id: string) => id === 'tr1' ? trigger : undefined },
+      triggers: { get: (id: string) => id === 'tr1' ? trigger : id === 'tr2' ? botTrigger : undefined },
       get: (key: string) => kv.get(key), set: (key: string, value: unknown) => { kv.set(key, value) }, delete: (key: string) => { kv.delete(key) },
       keys: (family: string | { prefix: string }) => [...kv.keys()].filter(key => key.startsWith(typeof family === 'string' ? family : family.prefix)),
       settings: () => ({ policy: { rules: [] }, executor: { directory: '' } }), atomic: <T>(work: () => T) => work(),
@@ -213,6 +216,21 @@ describe('MulticaExecutor', () => {
     await h.executor.reconcile('t1')
     expect(h.engine.report).toHaveBeenCalledWith('t1', expect.objectContaining({ state: 'failed', summary: expect.stringContaining('codebuddy') }))
     expect(h.engine.turnEnded).toHaveBeenCalled()
+  })
+
+  it('marks a bot\'s message as automated for the worker, and a person\'s not (#20)', async () => {
+    const h = setup(ticketWith([{ state: 'pending' }]))
+    await h.launch()
+    const description = (h.api.createIssue.mock.calls[0] as unknown as [{ description: string }])[0].description
+    const assignment = JSON.parse(description.slice(description.lastIndexOf('```json\n') + 8, description.lastIndexOf('\n```'))) as { trigger: Record<string, unknown> }
+    expect(assignment.trigger).toMatchObject({ trigger_id: 'tr1', from: 'jared' })
+    expect(assignment.trigger).not.toHaveProperty('automated')
+    const inputs = [{ id: 'i1', kind: 'trigger', triggerId: 'tr1', at: '' }, { id: 'i2', kind: 'trigger', triggerId: 'tr2', at: '' }]
+    h.setTicket(ticketWith([{}], { inputs, undelivered: ['i1', 'i2'] } as unknown as Partial<Ticket>))
+    h.runs.push({ id: 'r1', status: 'running' })
+    await h.deliver()
+    const lines = h.posted[0]!.content.split('\n').filter(line => line.startsWith('{')).map(line => JSON.parse(line) as Record<string, unknown>)
+    expect(lines.map(line => [line.trigger_id, line.from, line.automated])).toEqual([['tr1', 'jared', undefined], ['tr2', 'coderabbitai[bot]', true]])
   })
 
   it('does not comment while a run waits to start, then delivers every waiting Input in one comment', async () => {

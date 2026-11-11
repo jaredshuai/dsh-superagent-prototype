@@ -117,7 +117,7 @@ export function issueDescription(brief: Brief): string {
     '',
     '## How to report',
     '',
-    '- Before any other step of a run, post an `ack` for each trigger you have not acknowledged yet, in one sentence that says what you will do. Do it even when the work looks quick.',
+    '- Before any other step of a run, post an `ack` for each person\'s message you have not acknowledged yet, in one sentence that says what you will do. Do it even when the work looks quick. A message marked `"automated": true` comes from a bot or CI: use it as feedback on the work, but never `ack` it.',
     '',
     'Report by posting a comment on this issue with the multica CLI (`multica issue comment add <issue> --content-stdin`; reply under the comment that started your run with `--parent` when one did). The comment must contain one fenced block like these; anything else in the comment is ignored:',
     '',
