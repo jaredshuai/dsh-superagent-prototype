@@ -258,7 +258,10 @@ daemon_id 是机器级的，存在 `~/.multica/daemon.id`，CLI daemon 与桌面
   仍是该 Ticket 最后那条可能是回报的拒收（与 `unanswered` 同一口径；被拒的 `ack` 等不算）时，健康项恢复为 `ready`（`Connected to Multica`）；
   健康项只有一个槽位，期间被别的错误（如事件流断开、另一个 Ticket 的拒收）覆盖了就不动它（#18，JAR-84）。
   `dropped` 仍要求 `summary`：与 DshExecutor 的 `orchestrator_report` 相同，`summary` 是每个回报的必填项，`dropped` 结束 Ticket 时它就是给人的结论。
-- `ack`（#14）：issue 描述「How to report」第一条要求每个 run 在任何其他步骤之前，为每条还没确认的触发消息先发一个 `ack`，快活也要发。
+- `ack`（#14、#20）：issue 描述「How to report」第一条要求每个 run 在任何其他步骤之前，为每条还没确认的**人的消息**先发一个 `ack`，快活也要发。
+  机器人 / CI 发的触发（`Trigger.human` 为假）在给 Worker 的卡片里带 `"automated": true`（首条 Assignment 的 `trigger` / `batch` 与之后的
+  `superagent-input` 都是），描述写明这类消息只当作对工作的反馈、不发 `ack`——Engine 会拒掉对它们的确认（`ackNotPerson`），与 DSH Worker 的
+  skill「Do not acknowledge bots or CI」一致。
 - 多候选（`MULTICA_AGENT_IDS`）：候选健康 = agent 存在、未归档、`status` 不是 `offline`，且它绑定的 runtime `status = online`。
   健康快照来自 REST `GET /api/agents` 与 `GET /api/runtimes`，只在事件流每次（重）连接时、以及收到 `agent:` / `runtime:` / `daemon:`
   事件（`daemon:heartbeat*` 除外）时、以及某个候选的暂停到期时（见下「跨工作站改派」）取一次（同一时刻多个请求合并成一次），不做周期轮询（ADR 0002）。快照到手之前不派新 Ticket。
@@ -452,6 +455,28 @@ PR #8 的作者与提交作者都是 `jaredwtt1203`。
    这是上游 core 的设计（`src/core/intake.ts`：人的消息恢复已结束的 Ticket），不改。**操作约定：关 issue 不附评论；要说明，先评论、等 Ticket 处理完再关。**
 3. 其余记在 #18（已修，#24 线上验证了关闭宽限；见第 8 节「回报被拒的反馈」「Ticket 结束时关闭 issue」「跨工作站改派」）：Worker 自行改正被拒回报后 `worker` 健康项仍停在 `error`（重启才清掉）；
    `ready` 后关 issue 让收尾中的 run 记为 `cancelled`；致命失败暂停到期后不重新考虑原候选。
+
+### 8.2.2 claude 候选排第一与冒烟（2026-11-11，#20）
+
+**部署**：`MULTICA_AGENT_IDS` 改为 `<superagent-worker-jxccs-claude>,<superagent-worker-jxccs-codebuddy>,<superagent-worker-jaredai-mcode>`
+（claude 是 #7 评估时建好的 agent，模型 `sonnet`，runtime `Claude (jxccs)`；改前备份为 `~/.config/superagent.env.bak-20261111`），重启。
+当时 JaredAI 的 runtime 全部 offline（最后在线 02:32 UTC），JAREDHOME 自 11-07 起 offline，在线的候补只有 jxccs 的 codebuddy。
+
+**冒烟（superagent-sandbox，UTC）**：
+
+| issue | 时间线 | 结果 |
+| --- | --- | --- |
+| #25 → JAR-95 → PR #26 | 16:21:16 开 issue；16:21:49 Ticket 建立，指派 claude 候选；16:22:01 确认回复；16:22:22 `ready`、PR 开出（run 39 s）。16:22:38 CodeRabbit 在 PR 上贴自动摘要；16:23:00 作为新消息投给 Worker，起第二个 run；16:23:10 Worker 给这条消息发 `ack`，被拒（`Use the original human trigger, not a bot, CI or worker report`）；16:23:12 回报 `ready` | 派发、开 PR 正常，从开 issue 到 PR 约 1 分钟；**对机器人消息的 `ack` 被拒**，`worker` 健康项停在 `error`（#20） |
+| #27 → JAR-96 → PR #28 | 部署 `41e936e`（#20）后。19:14:43 开 issue；19:15:33 Ticket 建立；19:15:48 `ack`；19:16:09 `ready`、PR 开出。19:16:26 CodeRabbit 摘要；19:16:46 投给 Worker，输入里带 `"automated":true`；19:17:03 Worker 只回报 `ready`，说明「该消息来自机器人，按规则不做 ack」 | 没有被拒的块，`worker` 全程 `ready` |
+
+**发现**：
+
+1. **Worker 给机器人消息发 `ack`**（#20，已修）：描述原来写「为每个 trigger 发 `ack`」，卡片里也没有是不是人发的标记。装了 CodeRabbit 这类机器人的仓库每个 PR 都会遇到。修法见第 8 节「`ack`」。
+2. **机器人在 PR 上的每条发言都会多起一个 run**（约 20 s，不改）：这是 core 的设计，机器人 / CI 的反馈照常投给 Ticket 的 Worker；它不能授权新工作，但 Worker 要看一眼有没有要修的。
+3. 被拒的 `ack` 之后即使有 `report` 被接受，`worker` 健康项也不恢复（#18 的既定口径，重启才清掉）；#20 之后只有 Worker 不照描述做时才会出现。
+4. 服务器上非 login shell 的 ssh 里没有 `pnpm`：`pnpm build` 也要包在 `bash -lc` 里，否则重启跑的还是旧的 `lib/`。
+
+清理：sandbox 的 PR #26、#28 已关闭并删分支，issue #25、#27 已关闭（不附评论），JAR-95、JAR-96 随 Ticket 结束变为 `cancelled`。
 
 ## 8.3 steer 投递路径（#6）
 
