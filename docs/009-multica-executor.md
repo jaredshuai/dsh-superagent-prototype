@@ -37,7 +37,7 @@ DshExecutor 的 Worker 通过会话内的宿主工具与 Engine 交互（`src/ap
 
 | 方案 | 做法 | 优点 | 缺点 |
 | --- | --- | --- | --- |
-| A 远程 MCP | 云端暴露 HTTPS MCP 服务，提供上述工具，每个 Assignment 一个短期 token | 与 DshExecutor 语义最一致 | 需要公网入站端口；要求 Multica agent 能按 issue 注入 MCP 配置（待验证） |
+| A 远程 MCP | 云端暴露 HTTPS MCP 服务，提供上述工具，每个 Assignment 一个短期 token | 与 DshExecutor 语义最一致 | 需要公网入站端口；**Multica 不能按 issue 注入 MCP 配置**（已查源码，见 7.2），短期 token 只能落到 agent 级，按 Ticket 区分做不到 |
 | **B 评论信道（推荐先做）** | 工作站上装一个小 CLI `superagent-report`，它只是把结构化 JSON 作为**带固定标记的评论**发到 issue（底层调 `multica issue comment add`）；云端轮询评论/run-messages 解析标记块 | **云端只出站**，不开端口；任何能跑 shell 的 runtime 都能用；评论天然留痕可审计 | 延迟 = 轮询间隔；评论里的 JSON 要做签名/校验防伪造 |
 | C 末尾文本兜底 | run 结束仍无回报时，按 run 终态映射：completed → `waiting`，failed → `failed` | 零依赖 | 只能当兜底，信息量最少 |
 
@@ -171,7 +171,7 @@ daemon_id 是机器级的，存在 `~/.multica/daemon.id`，CLI daemon 与桌面
 3. 跨 run 的 workdir 隔离：第二个 run 能否 checkout 上一轮推送的分支继续干？
 4. steer 限额触顶后的行为（报错 / 静默丢弃）。
 5. 各 runtime（claude / codex / dsh）对「先读 issue 描述里的协议说明、再按协议回报」的遵从度。
-6. Multica agent 能否按 issue 注入 MCP 配置（决定方案 A 是否可行）。
+6. ~~Multica agent 能否按 issue 注入 MCP 配置~~：**不能**，方案 A 按原设计不可行，见 7.2。
 7. 用 `mul_` token 连 `wss://api.multica.ai/ws` 是否真能收到 `task:*` 与 `comment:created`（源码支持，线上未实测）；心跳与断线行为。
 
 ### 7.1 Spike 结论（2026-11-05，jxccs，测试 agent `failover-test-jxccs`，opencode runtime）
@@ -193,6 +193,31 @@ daemon_id 是机器级的，存在 `~/.multica/daemon.id`，CLI daemon 与桌面
 3. 否则：把 Ticket 的全部未投递 Input 合并成**一条**评论发出，记下评论 id；该 id 出现在某 run 的 `trigger_comment_id` / `delivered_comment_ids` 时调 `inputsDelivered`，该 run 进入 running 时调 `inputsRead`。
 4. 永不取消承载未投递 Input 的 queued run（会丢消息）；`stop` 取消 run 时，对应 Input 视为未投递。
 5. 每个 run 都是完整的一轮 turn，Worker 需要从 issue 描述 + 评论历史 + git 分支重建上下文；描述里的协议说明要强调「先读最新评论、不要重做已完成的步骤」。
+
+### 7.2 MCP 注入（第 6 项，2026-11-17，源码结论）
+
+源码：`multica-ai/multica` 公开仓库 `a1a5275`（2026-11-17），本地浅克隆在 `/tmp/multica-src`；与设计时引用的 `3a0fed5` 不同版本，但注入链路同形。
+
+**结论：Multica 没有「按 issue 注入 MCP 配置」的入口，方案 A（云端暴露 MCP 服务，每个 Assignment 一个短期 token 写进给 Worker 的配置）按原设计做不了。**
+
+MCP 配置只有三层，全部不认 issue：
+
+| 层 | 存哪 | 谁能写 | 生效范围 |
+| --- | --- | --- | --- |
+| 工作区库 + agent 绑定 | `workspace_mcp_server` / `agent_mcp_server` | owner/admin 的人类（agent actor 被拒：`requireWorkspaceMcpWriter`） | 绑到哪个 agent 就只对那个 agent 生效 |
+| agent 自己的 `mcp_config` | `agent.mcp_config` | agent owner 或 workspace owner/admin，经 `PUT /api/agents/<id>` 或 `multica agent update --mcp-config[-stdin|-file]` | 配置里写的全部 run |
+| per-task overlay | `agent_task_queue.runtime_mcp_overlay` | **只有服务端**：在 enqueue 时由 `ComposioOverlayBuilder`（`internal/integrations/composio/dispatch.go`）算出来，来源是发起人当前激活的 Composio 连接，没有 REST/CLI 入口能指定它 | 一个 run |
+
+合并次序是 `bound workspace servers < agent 自己的 < per-task overlay`（`internal/handler/workspace_mcp.go:30`，`ResolveAgentMcpConfig` 的名字冲突以 agent 自己那条为准），由 `buildClaimedTaskResponse` 在**每次 claim** 时现算（`internal/handler/daemon.go:3068–3131`）——所以改配置下一次 claim 就生效，不用重启 daemon；但要改的是 agent 级，改一次就是该 agent 之后的所有 run。
+
+落地到 runtime 的两条路：
+
+- `mcp_config` 原样交给 provider adapter：Claude / Codebuddy / Codex 经 `--mcp-config <临时文件>`（`pkg/agent/claude.go:79`、`codebuddy.go:121`），dsh 经 `buildDshMCPServers` 放进启动参数（`pkg/agent/dsh.go:219`），mcode / devin 走 ACP 的 `mcpServers`。三个候选 runtime（claude / codebuddy / mcode）都支持写 `mcp_config`。
+- 远程 MCP（daemon 在本机起 broker，把远端 HTTPS MCP 转发成本地端点）只对 `codex` / `claude` / `hermes` / `qoder` / `mcode` 开放（`internal/daemon/remote_mcp_broker.go:159` `providerSupportsRemoteMCPBroker`），**`dsh` 与 `codebuddy` 不在列**；而且这条路的连接来自 Plugin 安装（`PluginService.AgentMCPConnections`，按 workspace），也不是按 issue。
+- 工作区库条目本身要求是公网 HTTPS（`devorigin.go` 的开发例外要 `MULTICA_PLUGIN_DEV_ORIGINS` 显式点名，生产不设），所以「云端暴露服务」这一半能凑合，缺的是「按 Assignment 分配不同 token」那一半。
+
+**对方案 A 的影响**：短期 token 只能写在 agent 级的 `mcp_config` 里，那就是所有 Ticket 共用一份，失去「每个 Assignment 一个 token」的意义；要按 Ticket 区分，只能给每个 Ticket 建一个 agent，与本设计的多候选/改派模型冲突，不做。
+**替代路径**（若以后仍想给 Worker 提供结构化工具）：把 MCP 服务做成工作区库条目 + 绑到候选 agent（凭据由人一次性授权、按 workspace 共享），Ticket 级的区分靠 MCP 服务自己从请求里认——但请求里没有 Ticket id 可认，所以本质上只剩「全体 Ticket 共用一个受信服务」，与方案 B 的评论信道相比没有明显好处。**结论不变：B 为主、C 兜底，A 关闭。**
 
 ## 8. 实现状态（v1，2026-11-05）
 
@@ -336,7 +361,7 @@ daemon_id 是机器级的，存在 `~/.multica/daemon.id`，CLI daemon 与桌面
 1. ~~回报被拒只记在 `worker` 健康项里~~：已做，见上「回报被拒的反馈」与第 8.1 节。
 2. ~~多候选 agent~~：已做，见上「多候选」。~~跨机故障转移与改派（第 4 节第 2、2b 层）~~：已做，见上「跨工作站改派」（#8），真实环境演练见同处（2026-11-06）。
 3. ~~线上端到端联调~~：GitHub 与飞书私聊入口都已跑通到 PR 合并、Ticket 结束，见第 8.2 节。
-4. 第 7 节第 6 项（MCP 注入）。第 5 项（各 runtime 对协议的遵从度）已评估（#7，第 8.4 节），steer 投递路径已在线上实测（#6，第 8.3 节）。
+4. ~~第 7 节第 6 项（MCP 注入）~~：已查源码，结论是不能按 issue 注入，方案 A 关闭（7.2）。第 5 项（各 runtime 对协议的遵从度）已评估（#7，第 8.4 节），steer 投递路径已在线上实测（#6，第 8.3 节）。
 5. ~~Ticket 结束时关闭 issue~~：已做（#9），见上「Ticket 结束时关闭 issue」。
 
 ### 8.1 反馈评论会不会引出新 run

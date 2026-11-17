@@ -4,5 +4,5 @@
 
 ## Considered Options
 
-- **远程 MCP**：语义与本地工具最一致，但要公网入站端口，且要求 Multica 能按 issue 注入 MCP 配置（未验证）。留作以后。
+- **远程 MCP**：语义与本地工具最一致，但要公网入站端口，且要求 Multica 能按 issue 注入 MCP 配置。2026-11-17 查源码已经没有这条路：MCP 配置只有工作区库（按 agent 绑定）、agent 自己的 `mcp_config`（该 agent 的所有 run 共用）与服务端在 enqueue 时算出的 per-task overlay（来源是发起人的 Composio 连接，没有外部入口）三层，都按 agent 按 run，不认 issue，所以「每个 Assignment 一个短期 token」写不进去（见 [009](../009-multica-executor.md) 7.2）。放弃。
 - **HMAC 签名**：要求模型在 shell 里正确计算 HMAC，实测不可靠；作者校验由 Multica 服务端保证，加上 nonce 已能挡住提示注入伪造与旧 Assignment 的迟到回报。
