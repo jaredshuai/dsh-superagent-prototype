@@ -29,10 +29,7 @@ import { ENDED_STATUSES, WAITING_STATUSES, inputComment, isRefusalNote, isRefusa
 export interface MulticaExecutorConfig extends MulticaConnection {
   /** The Multica agents a new ticket's issue may be assigned to, in order of preference: each one runtime on one workstation. */
   agents: readonly string[]
-  /**
-   * Whether a new ticket goes to the first healthy agent and waits while none is (`MULTICA_AGENT_IDS`). Without it the
-   * first agent gets every ticket whatever its state, as with the single `MULTICA_AGENT_ID`, and Multica queues the run.
-   */
+  /** Whether to pick by health and wait if no candidate is healthy. Only the legacy `MULTICA_AGENT_ID` skips this. */
   pickHealthy: boolean
   /** Git remote workers clone, such as `https://github.com/owner/repo`. */
   repository?: string
@@ -42,18 +39,22 @@ export interface MulticaExecutorConfig extends MulticaConnection {
 
 /**
  * The Multica executor's configuration from the environment, or undefined to keep the DSH executor: `SUPERAGENT_EXECUTOR=multica`
- * selects it, with `MULTICA_TOKEN`, `MULTICA_WORKSPACE_ID` and either `MULTICA_AGENT_IDS` (ordered, comma-separated candidates
- * picked by health) or `MULTICA_AGENT_ID` (one agent, no health check) required; the list wins when both are set.
+ * selects it, with `MULTICA_TOKEN`, `MULTICA_WORKSPACE_ID` and `MULTICA_STANDARD_AGENT_IDS` (the ordered candidates for
+ * automatic dispatch). Without the standard list, `MULTICA_AGENT_IDS` or the older single `MULTICA_AGENT_ID` still works.
  * `MULTICA_SERVER_URL`, `SUPERAGENT_MULTICA_REPOSITORY` and `SUPERAGENT_MULTICA_INSTRUCTIONS` are optional. The token stays
  * in the environment, never in settings.
  * @throws Error naming the missing variables when the Multica executor is selected without them.
  */
 export function multicaConfigFromEnv(env: Record<string, string | undefined>): MulticaExecutorConfig | undefined {
   if (env.SUPERAGENT_EXECUTOR !== 'multica') return undefined
-  const candidates = (env.MULTICA_AGENT_IDS ?? '').split(',').map(id => id.trim()).filter(Boolean)
+  const standard = env.MULTICA_STANDARD_AGENT_IDS
+  const candidates = (standard ?? env.MULTICA_AGENT_IDS ?? '').split(',').map(id => id.trim()).filter(Boolean)
   const single = env.MULTICA_AGENT_ID?.trim()
   const missing = ['MULTICA_TOKEN', 'MULTICA_WORKSPACE_ID'].filter(name => !env[name]?.trim())
-  if (!candidates.length && !single) missing.push('MULTICA_AGENT_ID or MULTICA_AGENT_IDS')
+  if (!candidates.length) {
+    if (standard !== undefined) missing.push('a non-empty MULTICA_STANDARD_AGENT_IDS')
+    else if (!single) missing.push('MULTICA_AGENT_ID or MULTICA_AGENT_IDS')
+  }
   if (missing.length) throw new Error(`SUPERAGENT_EXECUTOR=multica needs ${missing.join(', ')}`)
   const repository = env.SUPERAGENT_MULTICA_REPOSITORY?.trim(), instructions = env.SUPERAGENT_MULTICA_INSTRUCTIONS?.trim()
   return { serverUrl: env.MULTICA_SERVER_URL?.trim() || 'https://api.multica.ai', token: env.MULTICA_TOKEN!.trim(),
@@ -342,8 +343,17 @@ export class MulticaExecutor implements Executor {
         if (ended && this.queueCloseIfEnded(ended)) return
         await this.host.api.setMetadata(issue.id, 'superagent_ticket', ticketId)
       } else {
+        // A retry or wake can reuse an issue from before the candidate list changed, but not an excluded assignee.
+        const from = this.agentOf(state)
+        const to = this.host.config.agents.includes(from) ? from : this.choose()
+        if (!to) { this.wait(ticketId, assignmentId); return }
         // Runs of earlier Assignments are the baseline: only runs that start from here on are this Assignment's turns.
         const before = await this.host.api.runs(state.issueId)
+        if (to !== from) {
+          await this.cancelActive(ticketId, state.issueId, before)
+          await this.host.api.assignIssue(state.issueId, to)
+          state = { ...(this.state(ticketId) ?? state), agentId: to }
+        }
         // The issue of a woken ticket was closed when the ticket ended; reopen it without a run, which the comment starts.
         if (state.closed) await this.host.api.setStatus(state.issueId, 'todo')
         const { closed: _closed, ...open } = state
@@ -357,6 +367,7 @@ export class MulticaExecutor implements Executor {
         if (ended && this.queueCloseIfEnded(ended)) return
         const refused = refusedOutcome(posted.trigger_outcomes ?? undefined, this.agentOf(state))
         if (refused) throw new Error(`Multica did not start the agent: ${refused}`)
+        this.dispatched(ticketId, to)
       }
       await this.host.api.setMetadata(this.state(ticketId)!.issueId, 'superagent_assignment', assignmentId).catch(() => { /* Informational only. */ })
       if (!current()) return
@@ -697,8 +708,8 @@ export class MulticaExecutor implements Executor {
   private async reassign(ticketId: string, assignmentId: string, reason: string, comments: readonly Comment[]): Promise<void> {
     const state = this.state(ticketId)!
     const from = this.agentOf(state)
-    const to = this.candidates.pick([from])
-      ?? (state.reassigning?.fatal && state.returnedTo !== from && this.candidates.healthy(from) ? from : undefined)
+    const mayReturn = state.reassigning?.fatal && state.returnedTo !== from && this.host.config.agents.includes(from)
+    const to = this.candidates.pick([from]) ?? (mayReturn && this.candidates.healthy(from) ? from : undefined)
     if (!to) { this.stranded.add(ticketId); this.askForWorkstation(ticketId, assignmentId, [from]); return }
     await this.cancelActive(ticketId, state.issueId)
     await this.host.api.assignIssue(state.issueId, to)

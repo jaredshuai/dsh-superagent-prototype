@@ -811,6 +811,28 @@ describe('MulticaExecutor', () => {
       expect(h.host.sessions.relay).toHaveBeenCalledTimes(1)
     })
 
+    it('waits for a standard candidate before resuming an issue assigned to an excluded agent', async () => {
+      const h = allOffline()
+      h.agents.push({ id: 'premium', status: 'idle', runtime_id: 'rt-up' })
+      h.setState({ issueId: 'issue-1', agentId: 'premium', closed: 'done', deliveries: [], seen: [], runs: {} })
+      await h.connect()
+      await h.launch()
+      expect(h.api.assignIssue).not.toHaveBeenCalled()
+      expect(h.api.addComment).not.toHaveBeenCalled()
+      expect(h.engine.assignmentStarted).not.toHaveBeenCalled()
+      expect(h.host.store.tickets.get('t1')!.attention?.question).toContain('No Multica workstation is online')
+
+      h.agents.find(agent => agent.id === 'a-ok')!.status = 'idle'
+      await h.push({ type: 'agent:status', payload: {} })
+      await h.runLaunches()
+      expect(h.api.createIssue).not.toHaveBeenCalled()
+      expect(h.api.assignIssue).toHaveBeenCalledWith('issue-1', 'a-ok')
+      expect(h.api.setStatus).toHaveBeenCalledWith('issue-1', 'todo')
+      expect(h.api.assignIssue.mock.invocationCallOrder[0]).toBeLessThan(h.api.addComment.mock.invocationCallOrder[0]!)
+      expect(h.engine.assignmentStarted).toHaveBeenCalledWith('t1', 'a1')
+      expect(h.host.store.tickets.get('t1')!.attention).toBeUndefined()
+    })
+
     it('dispatches a queued ticket once a candidate comes online, and withdraws the question', async () => {
       const h = allOffline()
       await h.connect()

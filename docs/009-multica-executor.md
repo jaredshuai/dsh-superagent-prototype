@@ -231,11 +231,16 @@ MCP 配置只有三层，全部不认 issue：
 | `SUPERAGENT_EXECUTOR=multica` | 是 | 选择 MulticaExecutor |
 | `MULTICA_TOKEN` | 是 | `mul_` 个人 token，只放环境变量（如 `~/.config/superagent.env`），不进设置 |
 | `MULTICA_WORKSPACE_ID` | 是 | |
-| `MULTICA_AGENT_IDS` | 二选一 | 有序的候选 Multica agent 列表，逗号分隔；新 Ticket 派给第一个健康的候选（见下「多候选」）。与 `MULTICA_AGENT_ID` 同时设置时以它为准 |
-| `MULTICA_AGENT_ID` | 二选一 | 旧写法：只有一个 agent（= 一台机器上的一个 runtime），不看健康状态、每张 Ticket 都派给它，行为与 v1 相同 |
+| `MULTICA_STANDARD_AGENT_IDS` | 推荐 | 常规执行的有序候选列表，逗号分隔；配置后完全替代下面两项，全部离线则等待，不换到名单外的 agent。设置为空会报错 |
+| `MULTICA_AGENT_IDS` | 旧配置 | 有序的候选 Multica agent 列表，逗号分隔；新 Ticket 派给第一个健康的候选（见下「多候选」）。与 `MULTICA_AGENT_ID` 同时设置时以它为准 |
+| `MULTICA_AGENT_ID` | 旧配置 | 旧写法：只有一个 agent（= 一台机器上的一个 runtime），不看健康状态、每张 Ticket 都派给它，行为与 v1 相同 |
 | `MULTICA_SERVER_URL` | 否 | 默认 `https://api.multica.ai` |
 | `SUPERAGENT_MULTICA_REPOSITORY` | 否 | Worker 克隆的仓库，如 `https://github.com/jaredshuai/superagent-sandbox` |
 | `SUPERAGENT_MULTICA_INSTRUCTIONS` | 否 | 追加给每个 Worker 的说明，如「用 `gh-agent` 提交和开 PR」 |
+
+**日常派工**：在 `MULTICA_STANDARD_AGENT_IDS` 里只填给常规任务准备的 Multica agent ID，首选和备选都用同档模型。例如 `MULTICA_STANDARD_AGENT_IDS=standard-on-workstation-a,standard-on-workstation-b`（示例值需换成实际 ID）。旧配置只有在不设置此项时才会生效。切换前先让旧候选上的在途工作跑完；已经有 issue 的 Ticket 重试或唤醒时，如果原 agent 不在当前名单，先等常规候选上线，再把同一个 issue 改派过去。
+
+实际模型仍由 Multica agent 和工作站上的编程 CLI 配置决定。给常规 agent 固定模型与凭据，不要把高级模型加入它的自动回退。需要用高级模型时，由人先确认，再在工作站手动运行这一轮；本版本没有飞书升级指令。复杂任务可以手动用 LoopForge Local 跑 SOP，走 SOP 不会改变模型档位。
 
 **与第 2 节的差异**：回报防伪第一版不用 HMAC（要求 LLM 在 shell 里算 HMAC 不可靠），改为三重校验：
 评论作者必须是配置的 agent（`author_type = agent`、`author_id` 匹配，由 Multica 服务端保证）、块内 `assignment` 必须是当前 Assignment、
