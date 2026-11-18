@@ -27,6 +27,7 @@ const CommentSchema = z.object({
 }).passthrough()
 export type Comment = z.infer<typeof CommentSchema>
 const IssueSchema = z.object({ id: z.string(), identifier: z.string().nullish(), status: z.string().nullish(), assignee_id: z.string().nullish(),
+  assignee_type: z.string().nullish(),
   metadata: z.record(z.string(), z.unknown()).nullish() }).passthrough()
 export type Issue = z.infer<typeof IssueSchema>
 /**
@@ -87,6 +88,10 @@ export class MulticaApi {
   /** Moves an issue to a status, such as `done` or `cancelled`, without the run a status change may otherwise start. */
   async setStatus(issueId: string, status: string, signal?: AbortSignal): Promise<void> {
     await this.request('PUT', `/api/issues/${encodeURIComponent(issueId)}`, z.unknown(), { status, suppress_run: true }, signal)
+  }
+  /** Reads the issue's actual assignee, including for tickets saved before the executor tracked it. */
+  issue(issueId: string, signal?: AbortSignal): Promise<Issue> {
+    return this.request('GET', `/api/issues/${encodeURIComponent(issueId)}`, IssueSchema, undefined, signal)
   }
   /**
    * Assigns an issue to another agent without the run the change would otherwise start; the comment that tells the agent

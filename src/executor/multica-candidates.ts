@@ -18,6 +18,15 @@ export class MulticaCandidates {
     this.agents = new Map(agents.map(agent => [agent.id, agent]))
     this.runtimes = new Map(runtimes.map(runtime => [runtime.id, runtime]))
   }
+  /** Configuration problems found in the snapshot, distinct from a valid candidate being offline. */
+  invalid(): { id: string; reason: string }[] {
+    if (!this.agents) return []
+    return this.order.flatMap(id => {
+      const agent = this.agents?.get(id)
+      const reason = !agent ? 'not found' : agent.archived_at ? 'archived' : !agent.runtime_id ? 'no assigned runtime' : undefined
+      return reason ? [{ id, reason }] : []
+    })
+  }
   /** Keeps a candidate out of `pick` until `until`, in this instance only. */
   suspend(agentId: string, until: number): void { this.suspended.set(agentId, until) }
   healthy(agentId: string): boolean {
