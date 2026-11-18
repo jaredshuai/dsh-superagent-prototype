@@ -1571,3 +1571,71 @@ it('PR22 recheck additional legacy launch preserves main fallback identity witho
   expect(h.engine.report).toHaveBeenCalledWith('t1', { state: 'progress', summary: 'Original configured worker' })
   expect(h.api.issue).not.toHaveBeenCalled()
 })
+
+describe('PR22 round3 replay edges', () => {
+  const oldInput = { id: 'input', issue_id: 'issue-1', author_type: 'member', content: 'Old input content', created_at: '' }
+  it('does not silently settle an excluded-queue replay if Multica explicitly refuses to start the assigned agent', async () => {
+    const h = setup(ticketWith([{}]), { agents: [AGENT], pickHealthy: true, standardOnly: true })
+    h.agents.push({ id: AGENT, status: 'idle', runtime_id: 'r' })
+    h.runtimes.push({ id: 'r', status: 'online' })
+    await h.connect()
+    h.setState({ issueId: 'issue-1', agentId: 'premium', assignment: { id: 'a1', nonce: 'n' }, seen: [], runs: { old: 'queued' }, deliveries: [
+      { commentId: 'input', inputIds: ['i1'], assignmentId: 'a1', read: false },
+    ] })
+    h.runs.push({ id: 'old', agent_id: 'premium', trigger_comment_id: 'input', status: 'queued' })
+    h.comments.push({ ...oldInput, content: 'Old input content with explicit standard-agent mention' })
+    h.engine.deliveryFailed.mockImplementation((_ticketId: string, _assignmentId: string, error: string) => {
+      h.setTicket({ ...h.host.store.tickets.get('t1')!, delivery: { error, at: h.at() } })
+    })
+    // Model the documented outcome for an explicitly mentioned agent refused by the dispatcher.
+    h.setOutcome('blocked')
+    await h.executor.reconcile('t1')
+    expect(h.api.cancelRun).toHaveBeenCalledWith('old')
+    expect(h.api.assignIssue).toHaveBeenCalledWith('issue-1', AGENT)
+    expect(h.posted).toEqual([{ content: 'Old input content with explicit standard-agent mention' }])
+    expect(h.engine.deliveryFailed).toHaveBeenCalledExactlyOnceWith('t1', 'a1', expect.stringContaining('blocked'))
+    expect(h.state()?.deliveries).toContainEqual(expect.objectContaining({ commentId: 'input', replayAfterCancel: 'old', read: false }))
+    // The comment created by the refused POST triggers reconciliation, but does not clear the failure.
+    await h.push({ type: 'comment:created', payload: { comment: { issue_id: 'issue-1' } } })
+    expect(h.api.addComment).toHaveBeenCalledTimes(1)
+
+    // A fresh Input uses the ordinary delivery effect; success clears the persisted ticket failure.
+    const stalled = h.host.store.tickets.get('t1')!
+    h.setTicket({ ...stalled, inputs: [{ id: 'i2', kind: 'text', text: 'New followup', at: '' }] as Ticket['inputs'], undelivered: ['i2'] })
+    h.engine.inputsDelivered.mockImplementation(() => {
+      const { delivery: _, ...ticket } = h.host.store.tickets.get('t1')!
+      h.setTicket({ ...ticket, undelivered: [] })
+    })
+    h.setOutcome('queued')
+    await h.deliver()
+    await h.executor.reconcile('t1')
+    expect(h.posted[1]?.content).toContain('New followup')
+    expect(h.posted[2]?.content).toBe('Old input content with explicit standard-agent mention')
+    expect(h.state()?.deliveries.some(delivery => delivery.replayAfterCancel)).toBe(false)
+  })
+  it('also recovers an Input whose unclaimed run was cancelled when its standard agent went offline', async () => {
+    const h = setup(ticketWith([{}]), { agents: ['stdA', 'stdB'], pickHealthy: true, standardOnly: true })
+    h.agents.push({ id: 'stdA', status: 'offline', runtime_id: 'r' }, { id: 'stdB', status: 'idle', runtime_id: 'r' })
+    h.runtimes.push({ id: 'r', status: 'online' })
+    await h.connect()
+    h.setState({ issueId: 'issue-1', agentId: 'stdA', assignment: { id: 'a1', nonce: 'n' }, seen: [], runs: { old: 'queued' }, deliveries: [
+      { commentId: 'input', inputIds: ['i1'], assignmentId: 'a1', read: false },
+    ] })
+    h.runs.push({ id: 'old', agent_id: 'stdA', trigger_comment_id: 'input', status: 'queued' })
+    h.comments.push(oldInput)
+    const inputs = [
+      { id: 'i1', kind: 'trigger', triggerId: 'tr1', deliveredTo: 'a1', readAt: null, at: '' },
+      { id: 'i2', kind: 'text', text: 'New followup', at: '' },
+    ] as Ticket['inputs']
+    h.setTicket(ticketWith([{}], { inputs, undelivered: ['i2'] }))
+    await h.deliver()
+    expect(h.api.cancelRun).toHaveBeenCalledWith('old')
+    expect(h.api.assignIssue).toHaveBeenCalledWith('issue-1', 'stdB')
+    expect(h.engine.inputsDelivered).toHaveBeenCalledWith('t1', 'a1', ['i2'])
+    expect(h.state()?.deliveries).toContainEqual(expect.objectContaining({ commentId: 'input', replayAfterCancel: 'old' }))
+    h.setTicket(ticketWith([{}], { inputs, undelivered: [] }))
+    await h.executor.reconcile('t1')
+    expect(h.posted.filter(post => post.content === 'Old input content')).toHaveLength(1)
+    expect(h.engine.inputsRead).not.toHaveBeenCalled()
+  })
+})

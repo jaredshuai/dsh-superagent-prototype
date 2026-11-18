@@ -109,7 +109,7 @@ export interface Delivery {
   commentId: string; inputIds: string[]; assignmentId: string; read?: boolean
   /** The running run the comment was steered into, while its daemon is still to hand it over. */
   steeredRun?: string
-  /** Replay this comment after the excluded run that would have read it is cancelled before starting. */
+  /** Replay this comment after the run that would have read it is cancelled before starting on this Assignment. */
   replayAfterCancel?: string
 }
 /** A refused report block: the `index`th block of an agent comment, and the note that tells its worker why. */
@@ -355,7 +355,7 @@ export class MulticaExecutor implements Executor {
     const to = eligible ? from : this.freshSnapshot() ? this.candidates.pick() : undefined
     if (!to) { this.waitForTarget(ticketId, assignmentId, kind); return undefined }
     const migrate = !author || from !== to
-    if (migrate) await this.cancelActive(ticketId, state.issueId, runs, current)
+    if (migrate) await this.cancelActive(ticketId, state.issueId, runs, current, kind === 'continue' ? assignmentId : undefined)
     if (!current()) return undefined
     // Drain the old Assignment's comments using its authorized author, not the current issue assignee. The
     // terminal-run snapshot (or cancellation of an unclaimed run) precedes the final comment read.
@@ -687,20 +687,22 @@ export class MulticaExecutor implements Executor {
   }
 
   /** Cancels the issue's active runs, recorded first as cancelled by this executor; `known` are its runs when just read. */
-  private async cancelActive(ticketId: string, issueId: string, known: readonly Run[] | undefined, current: () => unknown): Promise<void> {
+  private async cancelActive(ticketId: string, issueId: string, known: readonly Run[] | undefined, current: () => unknown,
+    replayForAssignment?: string): Promise<void> {
     const runs = known ?? await this.host.api.runs(issueId)
-    await this.cancelRuns(ticketId, runs.filter(run => !ENDED_STATUSES.has(run.status)), current)
+    await this.cancelRuns(ticketId, runs.filter(run => !ENDED_STATUSES.has(run.status)), current, replayForAssignment)
   }
-  private async cancelRuns(ticketId: string, runs: readonly Run[], current: () => unknown): Promise<void> {
+  /** Pass the surviving Assignment only when an automatic cancellation should replay its unread Inputs. */
+  private async cancelRuns(ticketId: string, runs: readonly Run[], current: () => unknown, replayForAssignment?: string): Promise<void> {
     for (const run of runs) {
       if (!current()) return
       const state = this.state(ticketId)
       if (state) {
-        const replay = this.host.config.standardOnly && run.agent_id && !this.inStandardPool(run.agent_id)
-          && UNCLAIMED_STATUSES.has(run.status) && !started(run, state.runs[run.id])
+        const replay = replayForAssignment !== undefined && UNCLAIMED_STATUSES.has(run.status) && !started(run, state.runs[run.id])
         // Persist the intent before cancelling: a crash after the server cancelled it must not strand the Input.
-        const deliveries = replay ? state.deliveries.map(delivery => !delivery.read && !delivery.steeredRun
-          && carriesInput(run, delivery.commentId) ? { ...delivery, replayAfterCancel: run.id } : delivery) : state.deliveries
+        const deliveries = replay ? state.deliveries.map(delivery => delivery.assignmentId === replayForAssignment
+          && !delivery.read && !delivery.steeredRun && carriesInput(run, delivery.commentId)
+          ? { ...delivery, replayAfterCancel: run.id } : delivery) : state.deliveries
         this.save(ticketId, { ...state, deliveries, cancelled: [...new Set([...state.cancelled ?? [], run.id])].slice(-HISTORY_LIMIT) })
       }
       await this.host.api.cancelRun(run.id)
@@ -777,7 +779,7 @@ export class MulticaExecutor implements Executor {
     if (!current()) return
     if (this.host.config.standardOnly) {
       const excluded = runs.filter(run => !!run.agent_id && !this.inStandardPool(run.agent_id) && UNCLAIMED_STATUSES.has(run.status))
-      await this.cancelRuns(ticketId, excluded, current)
+      await this.cancelRuns(ticketId, excluded, current, runningAssignment(ticket)?.id)
       if (!current()) return
       const cancelled = new Set(excluded.map(run => run.id))
       runs = runs.map(run => cancelled.has(run.id) ? { ...run, status: 'cancelled' } : run)
@@ -850,7 +852,7 @@ export class MulticaExecutor implements Executor {
     this.save(ticketId, { ...kept, seen: [...kept.seen, ...seen].slice(-SEEN_LIMIT),
       refusals: [...kept.refusals ?? [], ...refused].slice(-HISTORY_LIMIT), ...unanswered ? { unanswered } : {} })
   }
-  /** Reposts failed steers and Inputs whose excluded run was cancelled before starting. */
+  /** Reposts failed steers and Inputs whose run was cancelled before starting on the same Assignment. */
   private async settleDeliveries(ticketId: string, comments: readonly Comment[]): Promise<void> {
     const state = this.state(ticketId)
     const pending = state?.deliveries.filter(delivery => delivery.steeredRun || delivery.replayAfterCancel) ?? []
@@ -889,6 +891,8 @@ export class MulticaExecutor implements Executor {
       }
       // A replaced Assignment requeues its unread Trigger Inputs itself. Do not replay the old comment as well.
       if (assignment?.id !== delivery.assignmentId) { settle(); continue }
+      // A new successful Input clears the delivery failure; an issue event on its own does not.
+      if (delivery.replayAfterCancel && this.host.store.tickets.get(ticketId)?.delivery) continue
       const content = comments.find(comment => comment.id === delivery.commentId)?.content
       if (content === undefined) {
         if (!delivery.replayAfterCancel) settle()
@@ -901,8 +905,15 @@ export class MulticaExecutor implements Executor {
         const posted = await this.postIssueRun(ticketId, delivery.assignmentId, target.state, 'continue', current, () =>
           this.host.api.addComment(target.state.issueId, content))
         if (!posted || !current()) continue
-        settle({ commentId: posted.id, inputIds: delivery.inputIds, assignmentId: delivery.assignmentId, read: false })
         if (target.state.agentId && this.continuations.has(ticketId)) this.dispatched(ticketId, target.state.agentId)
+        if (delivery.replayAfterCancel) {
+          const refused = refusedOutcome(posted.trigger_outcomes ?? undefined, this.routingAgent(target.state))
+          if (refused) {
+            this.host.engine.deliveryFailed(ticketId, delivery.assignmentId, `Multica did not take the message: ${refused}`)
+            continue
+          }
+        }
+        settle({ commentId: posted.id, inputIds: delivery.inputIds, assignmentId: delivery.assignmentId, read: false })
       } catch (error) {
         if (this.host.closing() || (this.host.config.standardOnly && retryable(error))) throw error
         this.failure(`Posting again the Inputs from Multica comment ${delivery.commentId}`, error)
@@ -923,7 +934,7 @@ export class MulticaExecutor implements Executor {
     this.unclaimed.get(ticketId)?.(); this.unclaimed.delete(ticketId)
     const strays = runs.filter(run => run.agent_id && run.agent_id !== agent && !ENDED_STATUSES.has(run.status)
       && (!this.host.config.standardOnly || UNCLAIMED_STATUSES.has(run.status)))
-    await this.cancelRuns(ticketId, strays, stillCurrent)
+    await this.cancelRuns(ticketId, strays, stillCurrent, this.host.config.standardOnly ? assignmentId : undefined)
     if (!stillCurrent()) return undefined
     const current = this.state(ticketId)!
     const pending = current.reassigning?.assignmentId === assignmentId ? current.reassigning : undefined

@@ -335,7 +335,8 @@ MCP 配置只有三层，全部不认 issue：
     评论起新 agent 的 run。issue 不变，`superagent_ticket` metadata 照样反查到 Ticket。
   - 替换 Assignment 前处理已观测到的合法旧回报；新 Assignment 换了 nonce，之后不接受旧 Assignment 的回报。
     standard 对账独立取消已观测到的、明确带名单外 `agent_id` 的 `queued` / `deferred` / `waiting_local_directory` run，不需要先收到 Input，也不取消已认领的旧 run。
-    若该 run 尚未开始且承载未读 Input，先存重投标记，取消后在同一 Assignment 下等健康候选、沿用原评论内容重投；确认 run 确实开始或收到 steer 的 `delivered` 回执才记已读。
+    自动取消同一 Assignment 的未认领 run（也包括名单内从掉线 agent 换到健康备选）前，先为未读 Input 存重投标记；取消后等健康候选，沿用原评论内容重投。
+    确认 run 开始或收到 steer 的 `delivered` 回执才记已读。Multica 明确拒绝重投时保留标记并记 `deliveryFailed`，不会因评论事件反复补发；后续 Input 投递成功解除失败后可继续重投。
     不能阻止 Multica 在事件到达或取消生效前自行启动原生重试；名单限制保证的是执行器发起的请求，不是服务端原生重试的原子约束。
   - 没有其他健康候选：issue 不动（排队的 run 留着，原工作站回来仍可认领），按 #4 的「全部离线」行为问人一次（「…none of the other candidate Multica agents…」，
     记在 `multica-waiting:<ticket>`）。任一候选恢复健康后重新对账，改派成功即以 `question: null` 撤下问题。
