@@ -98,6 +98,7 @@ const host: MulticaExecutorHost = {
     settings: () => ({ policy: { rules: [] }, executor: { directory: '' } }), atomic: <T>(work: () => T) => work(),
   } as unknown as MulticaExecutorHost['store'],
   effects: {
+    pending: () => false,
     enqueue: (kind: string, _key: string, payload: unknown) => { run(kind, payload) },
     handle: (kind: string, handler: (payload: never) => Promise<void>) => { handlers[kind] = handler },
   } as unknown as MulticaExecutorHost['effects'],

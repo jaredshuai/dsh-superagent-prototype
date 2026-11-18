@@ -109,6 +109,7 @@ function setup(initial: Ticket, options: { agents?: string[]; pickHealthy?: bool
       settings: () => ({ policy: { rules: [] }, executor: { directory: '' } }), atomic: <T>(work: () => T) => work(),
     },
     effects: { enqueue: (kind: string, key: string) => { enqueued.push({ kind, key }) },
+      pending: (kind: string, key: string) => enqueued.some(row => row.kind === kind && row.key === key),
       handle: (kind: string, run: (payload: never) => Promise<void>) => { handlers[kind] = run } },
     sessions: { relay: vi.fn() },
     machine: { stateDir: '/state' }, lifetime: new AbortController().signal,
@@ -160,6 +161,7 @@ function setup(initial: Ticket, options: { agents?: string[]; pickHealthy?: bool
     at: (ms = 0) => new Date(clockNow + ms).toISOString(),
     launch: (assignmentId = 'a1') => handlers.launch!({ ticketId: 't1', assignmentId } as never),
     deliver: () => handlers.delivery!({ ticketId: 't1' } as never),
+    retryReconcile: () => handlers.multicaReconcile!({ ticketId: 't1' } as never),
   }
 }
 const report = (body: object, nonce: string, assignment = 'a1') =>
@@ -400,7 +402,9 @@ describe('MulticaExecutor', () => {
     h.runs.push({ id: 'r1', status: 'running' })
     await h.executor.reconcile('t1')
     expect(h.engine.reply).toHaveBeenCalledWith({ purpose: 'acknowledgement', ticketId: 't1', triggerId: 'tr1', text: 'On it' })
-    h.executor.stop(ticketWith([{}]), { id: 'a1' } as Assignment, 'stopped')
+    const stopped = ticketWith([{ state: 'ended' }])
+    h.setTicket(stopped)
+    h.executor.stop(stopped, stopped.assignments[0]!, 'stopped')
     await vi.waitFor(() => { expect(h.api.cancelRun).toHaveBeenCalledWith('r1') })
     h.runs[0]!.status = 'cancelled'
     await h.executor.reconcile('t1')
@@ -413,6 +417,7 @@ describe('MulticaExecutor', () => {
     async function ending(outcome: TicketOutcome, { by = 'executor', r1Status = 'queued' }: { by?: 'executor' | 'human'; r1Status?: string } = {}) {
       const h = setup(ticketWith([{ state: 'pending' }]))
       await h.launch()
+      await h.executor.reconcile('t1')
       h.setTicket(ticketWith([{}]))
       h.runs.push({ id: 'r1', status: r1Status }, { id: 'r0', status: 'completed' })
       const ended = ticketWith([{ state: 'ended' }], { ended: { at: '2026-11-05T01:00:00Z', by, outcome } } as Partial<Ticket>)
@@ -504,7 +509,7 @@ describe('MulticaExecutor', () => {
       expect(h.api.setStatus).toHaveBeenCalledTimes(1)
       expect(h.api.cancelRun).toHaveBeenCalledTimes(1)
     })
-    it('closes the issue again when its ticket ended while a later Assignment was being posted to it', async () => {
+    it('closes after the in-flight launch POST and cancels the run it started if the ticket stopped meanwhile', async () => {
       const { h } = await ending('stopped')
       h.setTicket(ticketWith([{ state: 'ended', endedReason: 'retried' }, { state: 'pending' }]))
       const ended = ticketWith([{ state: 'ended' }, { state: 'ended' }], { ended: { at: '2026-11-05T01:00:00Z', by: 'human', outcome: 'stopped' } } as Partial<Ticket>)
@@ -512,12 +517,13 @@ describe('MulticaExecutor', () => {
         h.setTicket(ended)
         h.executor.stop(ended, ended.assignments[1]!, 'stopped')
         await settle()
+        expect(h.api.setStatus).not.toHaveBeenCalled()
         h.runs.push({ id: 'r3', status: 'queued' })
         return { id: 'c9', issue_id: 'issue-1', author_type: 'member', content, created_at: '', trigger_outcomes: [] }
       })
       h.runs.splice(0)
       await h.launch('a2')
-      await vi.waitFor(() => { expect(h.api.setStatus).toHaveBeenCalledTimes(2) })
+      await vi.waitFor(() => { expect(h.api.setStatus).toHaveBeenCalledExactlyOnceWith('issue-1', 'cancelled') })
       expect(h.api.cancelRun).toHaveBeenCalledWith('r3')
     })
     it('records a failed close in the worker health entry and tries again on the next reconciliation', async () => {
@@ -549,6 +555,7 @@ describe('MulticaExecutor', () => {
     async function running() {
       const h = setup(ticketWith([{ state: 'pending' }]))
       await h.launch()
+      await h.executor.reconcile('t1')
       h.setTicket(ticketWith([{}]))
       h.runs.push({ id: 'r1', status: 'running' })
       return { h, nonce: h.state()!.assignment!.nonce }
@@ -977,7 +984,7 @@ describe('MulticaExecutor', () => {
       h.agents.find(agent => agent.id === 'a-ok')!.status = 'idle'
       await h.push({ type: 'agent:status', payload: {} })
       expect(h.api.assignIssue).toHaveBeenCalledExactlyOnceWith('issue-1', 'a-ok')
-      expect(h.posted[1]).toEqual({ content: expect.stringMatching(/^superagent: /), parentId: 'k1' })
+      expect(h.posted[1]).toEqual({ content: expect.stringMatching(/^superagent: .*comment k1/) })
       expect(h.api.assignIssue.mock.invocationCallOrder[0]!).toBeLessThan(h.api.addComment.mock.invocationCallOrder[1]!)
       expect(h.state()!.resentFor).toBe('a1')
     })
@@ -1248,5 +1255,200 @@ describe('MulticaExecutor', () => {
       await h.runLaunches()
       expect(assignedTo(h)).toEqual(['a-ok'])
     })
+  })
+})
+
+describe('PR22 independent race / failure checks', () => {
+  function auditSetup(legacy = false) {
+    const h = setup(ticketWith([{ state: 'pending' }]), { agents: ['std'], pickHealthy: true, standardOnly: !legacy })
+    h.agents.push({ id: 'std', status: 'idle', runtime_id: 'r' })
+    h.runtimes.push({ id: 'r', status: 'online' })
+    return h
+  }
+  it('does not post when the only candidate is known offline before assignIssue returns', async () => {
+    const h = auditSetup()
+    h.setState({ issueId: 'issue-1', agentId: 'premium', deliveries: [], seen: [], runs: {} })
+    await h.connect()
+    h.api.assignIssue.mockImplementationOnce(async (_issue, agent) => {
+      h.setAssignee(agent)
+      h.runtimes[0]!.status = 'offline'
+      await h.push({ type: 'runtime:updated', payload: {} })
+      expect(h.api.runtimes).toHaveBeenCalledTimes(2)
+    })
+    await h.launch()
+    expect(h.api.addComment).not.toHaveBeenCalled()
+    expect(h.engine.assignmentStarted).not.toHaveBeenCalled()
+  })
+  it('does not post after a reopened issue loses its only healthy candidate', async () => {
+    const h = auditSetup()
+    h.setState({ issueId: 'issue-1', agentId: 'std', closed: 'done', deliveries: [], seen: [], runs: {} })
+    await h.connect()
+    h.api.setStatus.mockImplementationOnce(async () => {
+      h.runtimes[0]!.status = 'offline'
+      await h.push({ type: 'runtime:updated', payload: {} })
+    })
+    await h.launch()
+    expect(h.api.setStatus).toHaveBeenCalledExactlyOnceWith('issue-1', 'todo')
+    expect(h.api.addComment).not.toHaveBeenCalled()
+    expect(h.engine.assignmentStarted).not.toHaveBeenCalled()
+  })
+  it('waits to create a new issue while health refreshes or has failed, then resumes on a valid snapshot', async () => {
+    const h = auditSetup()
+    await h.connect()
+    const refresh = Promise.withResolvers<{ id: string; status: string }[]>()
+    h.api.runtimes.mockImplementationOnce(() => refresh.promise)
+    await h.push({ type: 'runtime:updated', payload: {} })
+    await h.launch()
+    expect(h.api.createIssue).not.toHaveBeenCalled()
+    refresh.reject(new Error('Temporary runtime read failure'))
+    await settle()
+    await h.launch()
+    expect(h.api.createIssue).not.toHaveBeenCalled()
+    await h.advance(2000)
+    await h.runLaunches()
+    expect(h.api.createIssue).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ agentId: 'std' }))
+  })
+  it('checks the actual assignee again before posting and refuses a target that drifted', async () => {
+    const h = auditSetup()
+    h.setState({ issueId: 'issue-1', agentId: 'std', deliveries: [], seen: [], runs: {} })
+    await h.connect()
+    h.api.issue.mockResolvedValueOnce({ id: 'issue-1', assignee_type: 'agent', assignee_id: 'std' })
+    h.api.issue.mockResolvedValueOnce({ id: 'issue-1', assignee_type: 'agent', assignee_id: 'premium' })
+    await expect(h.launch()).rejects.toThrow('assignee changed')
+    expect(h.api.assignIssue).not.toHaveBeenCalled()
+    expect(h.api.addComment).not.toHaveBeenCalled()
+  })
+  it('retries a failed issue GET rather than taking it as an unassigned issue', async () => {
+    const h = auditSetup()
+    h.setState({ issueId: 'issue-1', agentId: 'premium', deliveries: [], seen: [], runs: {} })
+    await h.connect()
+    h.api.issue.mockRejectedValueOnce(new Error('Temporary assignee read failure'))
+    await expect(h.launch()).rejects.toThrow('Temporary assignee read failure')
+    expect(h.api.assignIssue).not.toHaveBeenCalled()
+    expect(h.api.addComment).not.toHaveBeenCalled()
+    expect(h.engine.report).not.toHaveBeenCalledWith('t1', expect.objectContaining({ state: 'failed' }))
+    await h.launch()
+    expect(h.api.assignIssue).toHaveBeenCalledExactlyOnceWith('issue-1', 'std')
+    expect(h.engine.assignmentStarted).toHaveBeenCalledWith('t1', 'a1')
+  })
+  it('does not take a partial assignee record as confirmation that the issue is unassigned', async () => {
+    const h = auditSetup()
+    h.setState({ issueId: 'issue-1', agentId: 'premium', deliveries: [], seen: [], runs: {} })
+    await h.connect()
+    h.api.issue.mockResolvedValueOnce({ id: 'issue-1', assignee_type: 'agent', assignee_id: null })
+    await expect(h.launch()).rejects.toThrow('incomplete assignee')
+    expect(h.api.assignIssue).not.toHaveBeenCalled()
+    expect(h.api.addComment).not.toHaveBeenCalled()
+  })
+  it('does not lose a final old-agent report if delivery sees run completion before reconciliation', async () => {
+    const h = auditSetup()
+    await h.connect()
+    h.setState({ issueId: 'issue-1', agentId: 'premium', assignment: { id: 'a1', nonce: 'n' }, deliveries: [], seen: [], runs: { old: 'running' } })
+    const inputs = [{ id: 'i1', kind: 'text', text: 'Follow up', at: '' }] as Ticket['inputs']
+    h.setTicket(ticketWith([{}], { inputs, undelivered: ['i1'] }))
+    h.runs.push({ id: 'old', agent_id: 'premium', status: 'running' })
+    await h.deliver()
+    h.comments.push({ ...agentComment('k1', report({ tool: 'report', state: 'progress', summary: 'Final output from old agent' }, 'n')), author_id: 'premium' })
+    h.runs[0]!.status = 'completed'
+    // The durable delivery wakes before the task/comment event is reconciled.
+    await h.deliver()
+    await h.executor.reconcile('t1')
+    expect(h.engine.report).toHaveBeenCalledExactlyOnceWith('t1', { state: 'progress', summary: 'Final output from old agent' })
+    expect(h.engine.report.mock.invocationCallOrder[0]!).toBeLessThan(h.api.assignIssue.mock.invocationCallOrder[0]!)
+  })
+  it('retries a transient assignment PUT failure for refusal resend', async () => {
+    const h = auditSetup()
+    await h.connect()
+    h.setState({ issueId: 'issue-1', agentId: 'premium', assignment: { id: 'a1', nonce: 'n' }, deliveries: [], seen: [], runs: { old: 'running' } })
+    h.setTicket(ticketWith([{}]))
+    h.runs.push({ id: 'old', agent_id: 'premium', status: 'completed' })
+    h.comments.push({ ...agentComment('k1', report({ tool: 'report', state: 'ready', summary: 'x' }, 'guess')), author_id: 'premium' })
+    h.api.assignIssue.mockRejectedValueOnce(new Error('transient PUT failure'))
+    await h.executor.reconcile('t1')
+    expect(h.enqueued).toContainEqual({ kind: 'multicaReconcile', key: 't1' })
+    expect(h.api.assignIssue).toHaveBeenCalledTimes(1)
+    // Run the persisted effect's handler without relying on another issue/runtime event.
+    await h.retryReconcile()
+    expect(h.api.assignIssue).toHaveBeenCalledTimes(2)
+    expect(h.posted).toContainEqual({ content: expect.stringMatching(/^superagent: .*comment k1/) })
+  })
+  it('legacy state without agentId keeps accepting original configured agent reports on assignee GET outage', async () => {
+    const h = auditSetup(true)
+    await h.connect()
+    h.setState({ issueId: 'issue-1', assignment: { id: 'a1', nonce: 'n' }, deliveries: [], seen: [], runs: {} })
+    h.setAssignee('std')
+    h.setTicket(ticketWith([{}]))
+    h.api.issue.mockRejectedValue(new Error('GET temporarily down'))
+    h.comments.push({ ...agentComment('k1', report({ tool: 'report', state: 'progress', summary: 'From original agent' }, 'n')), author_id: 'std' })
+    await h.executor.reconcile('t1')
+    expect(h.engine.report).toHaveBeenCalledWith('t1', { state: 'progress', summary: 'From original agent' })
+  })
+})
+
+describe('PR22 independent Multica routing', () => {
+  function auditSetup() {
+    const h = setup(ticketWith([{ state: 'pending' }]), { agents: ['stdA', 'stdB'], pickHealthy: true, standardOnly: true })
+    h.agents.push({ id: 'stdA', status: 'offline', runtime_id: 'r' }, { id: 'stdB', status: 'idle', runtime_id: 'r' })
+    h.runtimes.push({ id: 'r', status: 'online' })
+    return h
+  }
+  it('posts refusal resend at top level so Multica does not route it to the original author', async () => {
+    const h = auditSetup()
+    await h.connect()
+    h.setState({ issueId: 'issue-1', agentId: 'premium', assignment: { id: 'a1', nonce: 'n' }, deliveries: [], seen: [], runs: { old: 'running' } })
+    h.setTicket(ticketWith([{}]))
+    h.runs.push({ id: 'old', agent_id: 'premium', status: 'completed' })
+    h.comments.push({ ...agentComment('k1', report({ tool: 'report', state: 'ready', summary: 'x' }, 'guess')), author_id: 'premium' })
+    await h.executor.reconcile('t1')
+    expect(h.api.assignIssue).toHaveBeenCalledExactlyOnceWith('issue-1', 'stdB')
+    // Simulate routeReplyToParentAuthor (009 §8.1) vs routeAssigneeFallback.
+    const targetOfResend = h.posted.filter(item => !item.content.startsWith('/note'))
+      .map(item => item.parentId ? h.comments.find(c => c.id === item.parentId)?.author_id : h.state()?.agentId)
+    expect(targetOfResend).toEqual(['stdB'])
+  })
+  it('recognizes a previously posted top-level resend by its stable marker', async () => {
+    const h = auditSetup()
+    await h.connect()
+    h.setTicket(ticketWith([{}]))
+    const resend = 'superagent: report block 1 in comment k1 was refused: wrong nonce.'
+    h.setState({ issueId: 'issue-1', agentId: 'stdB', assignment: { id: 'a1', nonce: 'n' }, deliveries: [], seen: ['k1'], runs: {},
+      unanswered: { assignmentId: 'a1', commentId: 'k1', resend } })
+    h.comments.push({ id: 'already-posted', issue_id: 'issue-1', author_type: 'member', author_id: 'operator', created_at: '',
+      content: `${resend}\n\n<!-- superagent-refusal-resend:a1:k1 -->` })
+    await h.executor.reconcile('t1')
+    expect(h.api.addComment).not.toHaveBeenCalled()
+    expect(h.state()?.resentFor).toBe('a1')
+  })
+  it('serializes durable input delivery with failure-based reassignment', async () => {
+    const h = auditSetup()
+    await h.connect()
+    h.setState({ issueId: 'issue-1', agentId: 'stdA', assignment: { id: 'a1', nonce: 'n' }, deliveries: [], seen: [], runs: { old: 'running' } })
+    const inputs = [{ id: 'i1', kind: 'text', text: 'Follow up', at: '' }] as Ticket['inputs']
+    h.setTicket(ticketWith([{}], { inputs, undelivered: ['i1'] }))
+    h.runs.push({ id: 'old', agent_id: 'stdA', status: 'failed', failure_reason: 'runtime_offline' })
+    const putReached = Promise.withResolvers<void>()
+    const put = Promise.withResolvers<void>()
+    h.api.assignIssue.mockImplementationOnce(async (_issue, agent) => { putReached.resolve(); await put.promise; h.setAssignee(agent) })
+    const failover = h.executor.reconcile('t1')
+    await putReached.promise
+    const delivery = h.deliver()
+    await settle()
+    const callsDuringFirstPut = h.api.assignIssue.mock.calls.length
+    const postsDuringFirstPut = h.posted.length
+    put.resolve()
+    await Promise.all([failover, delivery])
+    expect([callsDuringFirstPut, postsDuringFirstPut]).toEqual([1, 0])
+    expect(h.engine.assignmentReassigned).toHaveBeenCalledOnce()
+    expect(h.api.addComment).not.toHaveBeenCalled()
+  })
+  it('cancels a server auto-retry for an excluded agent even without Inputs', async () => {
+    const h = auditSetup()
+    await h.connect()
+    h.setState({ issueId: 'issue-1', agentId: 'premium', assignment: { id: 'a1', nonce: 'n' }, deliveries: [], seen: [], runs: { old: 'running' } })
+    h.setTicket(ticketWith([{}]))
+    h.runs.push({ id: 'old', agent_id: 'premium', status: 'failed', failure_reason: 'runtime_offline' },
+      { id: 'auto-retry', agent_id: 'premium', status: 'deferred' }, { id: 'claimed', agent_id: 'premium', status: 'running' })
+    await h.executor.reconcile('t1')
+    expect(h.api.cancelRun).toHaveBeenCalledExactlyOnceWith('auto-retry')
   })
 })
