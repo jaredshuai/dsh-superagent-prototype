@@ -72,7 +72,7 @@ export interface MulticaTicketState {
   agentId?: string
   identifier?: string
   /** The current report nonce and (in standard mode) its authorized author, separate from the issue assignee. */
-  assignment?: { id: string; nonce: string; reportAgentId?: string }
+  assignment?: { id: string; nonce: string; reportAgentId?: string | null }
   /** Comments that carried Inputs, and whether a run has taken them in. */
   deliveries: Delivery[]
   /** Agent comments already processed for report blocks. */
@@ -109,6 +109,8 @@ export interface Delivery {
   commentId: string; inputIds: string[]; assignmentId: string; read?: boolean
   /** The running run the comment was steered into, while its daemon is still to hand it over. */
   steeredRun?: string
+  /** Replay this comment after the excluded run that would have read it is cancelled before starting. */
+  replayAfterCancel?: string
 }
 /** A refused report block: the `index`th block of an agent comment, and the note that tells its worker why. */
 export interface Refusal { commentId: string; index: number; note: string }
@@ -140,6 +142,9 @@ const SEEN_LIMIT = 500
 const HISTORY_LIMIT = 50
 const UNCLAIMED_STATUSES = new Set(['queued', 'deferred', 'waiting_local_directory'])
 const claimed = (run: Run) => run.status === 'running' || run.status === 'dispatched'
+const carriesInput = (run: Run, commentId: string) => run.trigger_comment_id === commentId || !!run.delivered_comment_ids?.includes(commentId)
+// Even a queued run can list its triggering comment. Require evidence that the daemon actually started it.
+const started = (run: Run, previous?: string) => !!run.started_at || run.status === 'running' || run.status === 'completed' || previous === 'running'
 const retryable = (error: unknown) => !(error instanceof MulticaError) || error.status === 0 || error.status === 408 || error.status === 429 || error.status >= 500
 
 export interface MulticaExecutorHost {
@@ -314,9 +319,18 @@ export class MulticaExecutor implements Executor {
     }
     return issue.assignee_type === 'agent' ? issue.assignee_id || undefined : undefined
   }
-  private reportAgent(state: MulticaTicketState): string | undefined {
-    return this.host.config.standardOnly ? state.assignment?.reportAgentId ?? state.agentId
-      : state.agentId ?? this.host.config.agents[0]
+  private routingAgent(state: MulticaTicketState): string | undefined {
+    return state.agentId ?? (this.host.config.standardOnly ? undefined : this.host.config.agents[0])
+  }
+  private reportAgent(state: MulticaTicketState, runs: readonly Run[] = []): string | undefined {
+    if (!this.host.config.standardOnly) return this.routingAgent(state)
+    const author = state.assignment?.reportAgentId
+    if (author === null) return undefined // Explicitly unknown; observing an unrelated run must not grant authorization later.
+    if (author || state.agentId) return author ?? state.agentId
+    // A remote assignee can change behind us. Only a run already recorded as executing for the old ticket is evidence of authorship.
+    const recorded = new Set(runs.flatMap(run => run.agent_id && state.runs[run.id] === 'running' && !state.cancelled?.includes(run.id)
+      ? [run.agent_id] : []))
+    return recorded.size === 1 ? recorded.values().next().value : undefined
   }
   private freshSnapshot(epoch = this.healthEpoch): boolean {
     return this.streamConnected && !this.refreshing && this.snapshotEpoch === epoch && this.healthEpoch === epoch
@@ -329,19 +343,19 @@ export class MulticaExecutor implements Executor {
   private async prepareIssueRun(ticketId: string, assignmentId: string, state: MulticaTicketState, kind: 'launch' | 'continue',
     current: () => unknown): Promise<{ state: MulticaTicketState; runs: Run[] } | undefined> {
     const standard = this.host.config.standardOnly
-    const from = standard ? await this.readAssignee(state)
-      : state.agentId ?? (kind === 'launch' ? await this.readAssignee(state).catch(() => undefined) : undefined) ?? this.host.config.agents[0]
+    const from = standard ? await this.readAssignee(state) : undefined
     const runs = await this.host.api.runs(state.issueId)
     if (!current()) return undefined
-    if (!standard) return { state: { ...state, agentId: from }, runs }
-    const author = this.reportAgent(state) ?? from
-    const eligible = this.freshSnapshot() && this.inStandardPool(from) && this.candidates.healthy(from)
+    if (!standard) return { state, runs }
+    const author = this.reportAgent(state, runs)
+    const eligible = !!author && this.freshSnapshot() && this.inStandardPool(from) && this.candidates.healthy(from)
     // A steer can fall back to opening a run. Let a claimed run on another agent finish instead.
     if (kind === 'continue' && runs.some(run => claimed(run) && (!eligible || (author && author !== from)
       || (run.agent_id && run.agent_id !== from)))) return undefined
     const to = eligible ? from : this.freshSnapshot() ? this.candidates.pick() : undefined
     if (!to) { this.waitForTarget(ticketId, assignmentId, kind); return undefined }
-    if (from !== to) await this.cancelActive(ticketId, state.issueId, runs, current)
+    const migrate = !author || from !== to
+    if (migrate) await this.cancelActive(ticketId, state.issueId, runs, current)
     if (!current()) return undefined
     // Drain the old Assignment's comments using its authorized author, not the current issue assignee. The
     // terminal-run snapshot (or cancellation of an unclaimed run) precedes the final comment read.
@@ -352,12 +366,12 @@ export class MulticaExecutor implements Executor {
       if (!current()) return undefined
     }
     const latest = this.state(ticketId) ?? state
-    if (from !== to) await this.host.api.assignIssue(state.issueId, to)
+    if (migrate) await this.host.api.assignIssue(state.issueId, to)
     // Even if the request outlived this Assignment, persist factual remote state; do not advance protocol state.
-    const target = { ...latest, agentId: to, ...kind === 'continue' && latest.assignment && author
-      ? { assignment: { ...latest.assignment, reportAgentId: author } } : {} }
+    const target = { ...latest, agentId: to, ...kind === 'continue' && latest.assignment
+      ? { assignment: { ...latest.assignment, reportAgentId: author ?? null } } : {} }
     this.save(ticketId, target)
-    return current() ? { state: target, runs: from !== to && kind === 'continue' ? [] : runs } : undefined
+    return current() ? { state: target, runs: migrate && kind === 'continue' ? [] : runs } : undefined
   }
   /** Re-reads assignee and fences every run-starting comment immediately before its POST. */
   private async postIssueRun(ticketId: string, assignmentId: string, target: MulticaTicketState, kind: 'launch' | 'continue',
@@ -479,7 +493,7 @@ export class MulticaExecutor implements Executor {
         const { closed: _closed, ...open } = state
         if (state.closed) this.save(ticketId, open)
         const moved = first.ticket.assignments.at(-2)?.endedReason === 'reassigned'
-          ? `it was reassigned, and Multica agent ${state.agentId} runs it now; the first new message says why.` : undefined
+          ? `it was reassigned, and Multica agent ${this.routingAgent(state)} runs it now; the first new message says why.` : undefined
         const posted = await this.postIssueRun(ticketId, assignmentId, open, 'launch', current, () => {
           this.save(ticketId, { ...open, assignment: { id: assignmentId, nonce,
             ...this.host.config.standardOnly ? { reportAgentId: open.agentId } : {} }, runs: Object.fromEntries(before.map(run => [run.id, run.status])),
@@ -491,7 +505,7 @@ export class MulticaExecutor implements Executor {
         // A ticket that ended while the comment was posted may have closed the issue before the comment started a run.
         const ended = this.host.store.tickets.get(ticketId)
         if (ended && this.queueCloseIfEnded(ended)) return
-        const refused = refusedOutcome(posted.trigger_outcomes ?? undefined, state.agentId)
+        const refused = refusedOutcome(posted.trigger_outcomes ?? undefined, this.routingAgent(state))
         if (refused) throw new Error(`Multica did not start the agent: ${refused}`)
         if (state.agentId) this.dispatched(ticketId, state.agentId)
       }
@@ -652,7 +666,7 @@ export class MulticaExecutor implements Executor {
         this.host.api.addComment(target.state.issueId, inputComment(messages), plan.kind === 'steer' ? { steer: [plan.runId] } : {}))
       if (!posted || !current()) return
       if (target.state.agentId && this.continuations.has(ticketId)) this.dispatched(ticketId, target.state.agentId)
-      const refused = refusedOutcome(posted.trigger_outcomes ?? undefined, target.state.agentId)
+      const refused = refusedOutcome(posted.trigger_outcomes ?? undefined, this.routingAgent(target.state))
       if (refused) { this.host.engine.deliveryFailed(ticketId, assignment.id, `Multica did not take the message: ${refused}`); return }
       // A plain comment that steered names no outcome, only a receipt; without one it is an ordinary comment that Multica
       // queued for the next run, as when the run ended or stopped accepting messages before the comment reached it.
@@ -667,7 +681,8 @@ export class MulticaExecutor implements Executor {
     } catch (error) {
       if (this.host.closing()) throw error
       if (!(error instanceof Later) && current()) this.host.engine.deliveryFailed(ticketId, assignment.id, String(error))
-      throw error
+      if (retryable(error)) throw error
+      this.failure(`Delivering Inputs to ${state.identifier ?? state.issueId}`, error)
     }
   }
 
@@ -680,7 +695,14 @@ export class MulticaExecutor implements Executor {
     for (const run of runs) {
       if (!current()) return
       const state = this.state(ticketId)
-      if (state) this.save(ticketId, { ...state, cancelled: [...new Set([...state.cancelled ?? [], run.id])].slice(-HISTORY_LIMIT) })
+      if (state) {
+        const replay = this.host.config.standardOnly && run.agent_id && !this.inStandardPool(run.agent_id)
+          && UNCLAIMED_STATUSES.has(run.status) && !started(run, state.runs[run.id])
+        // Persist the intent before cancelling: a crash after the server cancelled it must not strand the Input.
+        const deliveries = replay ? state.deliveries.map(delivery => !delivery.read && !delivery.steeredRun
+          && carriesInput(run, delivery.commentId) ? { ...delivery, replayAfterCancel: run.id } : delivery) : state.deliveries
+        this.save(ticketId, { ...state, deliveries, cancelled: [...new Set([...state.cancelled ?? [], run.id])].slice(-HISTORY_LIMIT) })
+      }
       await this.host.api.cancelRun(run.id)
     }
   }
@@ -742,17 +764,14 @@ export class MulticaExecutor implements Executor {
       const latest = live && liveTicket(live) ? latestAssignment(live) : undefined
       return !!live && liveTicket(live) && latest?.id === generation?.id && latest?.state === generation?.state
     }
-    if (this.host.config.standardOnly && state.assignment && !state.assignment.reportAgentId && runningAssignment(ticket)) {
-      const author = state.agentId ?? await this.readAssignee(state)
-      if (!current()) return
-      if (author && state.assignment) {
-        state = { ...state, agentId: author, assignment: { ...state.assignment, reportAgentId: author } }
-        this.save(ticketId, state)
-      }
-    }
     const [observed, comments] = await Promise.all([this.host.api.runs(state.issueId), this.host.api.comments(state.issueId)])
     let runs = observed
     if (!current()) return
+    if (this.host.config.standardOnly && state.assignment?.id === generation?.id && state.assignment
+      && state.assignment.reportAgentId === undefined && runningAssignment(ticket)) {
+      state = { ...state, assignment: { ...state.assignment, reportAgentId: this.reportAgent(state, runs) ?? null } }
+      this.save(ticketId, state)
+    }
     // Reports first, so a report and the end of the turn that made it arrive in that order.
     if (state.assignment?.id === generation?.id) await this.reconcileReports(ticketId, state, comments, this.reportAgent(state), current)
     if (!current()) return
@@ -768,16 +787,18 @@ export class MulticaExecutor implements Executor {
     const fresher = this.state(ticketId) ?? state
     const deliveries = fresher.deliveries.map(delivery => {
       if (delivery.read) return delivery
-      const took = runs.some(run => run.status !== 'queued' && !WAITING_STATUSES.has(run.status)
-        && (run.trigger_comment_id === delivery.commentId || run.delivered_comment_ids?.includes(delivery.commentId)))
-      if (took) this.host.engine.inputsRead(ticketId, delivery.inputIds)
-      return took ? { ...delivery, read: true } : delivery
+      const took = runs.some(run => carriesInput(run, delivery.commentId) && (this.host.config.standardOnly
+        ? started(run, state.runs[run.id]) : run.status !== 'queued' && !WAITING_STATUSES.has(run.status)))
+      if (!took) return delivery
+      this.host.engine.inputsRead(ticketId, delivery.inputIds)
+      const { replayAfterCancel: _, ...read } = delivery
+      return { ...read, read: true }
     })
     const statuses = Object.fromEntries(runs.map(run => [run.id, run.status]))
     this.save(ticketId, { ...fresher, deliveries: deliveries.slice(-HISTORY_LIMIT), runs: statuses })
     await this.answerRefusals(ticketId, comments, current)
     if (!current()) return
-    if (this.state(ticketId)?.deliveries.some(delivery => delivery.steeredRun)) await this.settleSteers(ticketId, comments)
+    if (this.state(ticketId)?.deliveries.some(delivery => delivery.steeredRun || delivery.replayAfterCancel)) await this.settleDeliveries(ticketId, comments)
     if (!current()) return
     const live = this.host.store.tickets.get(ticketId)
     const assignment = live && liveTicket(live) ? runningAssignment(live) : undefined
@@ -829,56 +850,64 @@ export class MulticaExecutor implements Executor {
     this.save(ticketId, { ...kept, seen: [...kept.seen, ...seen].slice(-SEEN_LIMIT),
       refusals: [...kept.refusals ?? [], ...refused].slice(-HISTORY_LIMIT), ...unanswered ? { unanswered } : {} })
   }
-  /**
-   * Follows the comments steered into running runs: a run's daemon handing one over reads its Inputs; one whose run ended
-   * first is posted again as a plain comment for the next run, since Multica leaves a member's failed steer to its author.
-   * Runs in the same Ticket lane as ordinary delivery, so it sees every delivery recorded before it and posts no comment beside one.
-   */
-  private async settleSteers(ticketId: string, comments: readonly Comment[]): Promise<void> {
+  /** Reposts failed steers and Inputs whose excluded run was cancelled before starting. */
+  private async settleDeliveries(ticketId: string, comments: readonly Comment[]): Promise<void> {
     const state = this.state(ticketId)
-    const steered = state?.deliveries.filter(delivery => delivery.steeredRun) ?? []
-    if (!state || !steered.length) return
-    const [receipts, runs] = await Promise.all([this.host.api.steerReceipts(state.issueId), this.host.api.runs(state.issueId)])
+    const pending = state?.deliveries.filter(delivery => delivery.steeredRun || delivery.replayAfterCancel) ?? []
+    if (!state || !pending.length) return
+    const [receipts, runs] = await Promise.all([pending.some(delivery => delivery.steeredRun)
+      ? this.host.api.steerReceipts(state.issueId) : undefined, this.host.api.runs(state.issueId)])
     const ticket = this.host.store.tickets.get(ticketId)
     const assignment = ticket && liveTicket(ticket) ? runningAssignment(ticket) : undefined
-    /** What each settled steer becomes: its delivery read, a plain delivery posted in its place, or nothing. */
-    const settled = new Map<string, Delivery | undefined>()
-    for (const delivery of steered) {
-      const receipt = receipts.get(delivery.commentId)?.find(item => item.task_id === delivery.steeredRun)
-      if (receipt?.status === 'delivered') {
-        this.host.engine.inputsRead(ticketId, delivery.inputIds)
-        const { steeredRun: _, ...rest } = delivery
-        settled.set(delivery.commentId, { ...rest, read: true })
+    for (const delivery of pending) {
+      // Commit each successful replacement before attempting the next POST, so a later error cannot replay this one.
+      const settle = (replacement?: Delivery) => {
+        const latest = this.state(ticketId) ?? state
+        this.save(ticketId, { ...latest, deliveries: latest.deliveries.flatMap(item =>
+          item.commentId !== delivery.commentId ? [item] : replacement ? [replacement] : []) })
+      }
+      if (delivery.steeredRun) {
+        const receipt = receipts?.get(delivery.commentId)?.find(item => item.task_id === delivery.steeredRun)
+        if (receipt?.status === 'delivered') {
+          this.host.engine.inputsRead(ticketId, delivery.inputIds)
+          const { steeredRun: _, ...rest } = delivery
+          settle({ ...rest, read: true })
+          continue
+        }
+        // Pending until the daemon takes it or the run ends, which marks the steer failed in the same transaction.
+        const runEnded = ENDED_STATUSES.has(runs.find(run => run.id === delivery.steeredRun)?.status ?? 'completed')
+        if (receipt ? receipt.status !== 'failed' : !runEnded) continue
+      } else {
+        // A daemon can start the old run before cancellation reaches the server. Don't replay a comment it took.
+        if (runs.some(run => carriesInput(run, delivery.commentId) && started(run, state.runs[run.id]))) {
+          this.host.engine.inputsRead(ticketId, delivery.inputIds)
+          const { replayAfterCancel: _, ...rest } = delivery
+          settle({ ...rest, read: true })
+          continue
+        }
+        if (runs.some(run => run.id === delivery.replayAfterCancel && !ENDED_STATUSES.has(run.status))) continue
+      }
+      // A replaced Assignment requeues its unread Trigger Inputs itself. Do not replay the old comment as well.
+      if (assignment?.id !== delivery.assignmentId) { settle(); continue }
+      const content = comments.find(comment => comment.id === delivery.commentId)?.content
+      if (content === undefined) {
+        if (!delivery.replayAfterCancel) settle()
         continue
       }
-      // Pending until the run's daemon takes it or the run ends, which marks it failed in the same transaction.
-      const runEnded = ENDED_STATUSES.has(runs.find(run => run.id === delivery.steeredRun)?.status ?? 'completed')
-      if (receipt ? receipt.status !== 'failed' : !runEnded) continue
-      const content = comments.find(comment => comment.id === delivery.commentId)?.content
-      // Inputs of an Assignment that no longer runs are not posted to the next one; nor is a comment that is gone.
-      if (assignment?.id !== delivery.assignmentId || content === undefined) { settled.set(delivery.commentId, undefined); continue }
       try {
         const current = () => this.running(ticketId, delivery.assignmentId)
         const target = await this.prepareIssueRun(ticketId, delivery.assignmentId, this.state(ticketId) ?? state, 'continue', current)
-        // A run that waits to start would take the plain comment as a run of its own; its start reconciles again.
         if (!target || !current() || target.runs.some(run => WAITING_STATUSES.has(run.status))) continue
         const posted = await this.postIssueRun(ticketId, delivery.assignmentId, target.state, 'continue', current, () =>
           this.host.api.addComment(target.state.issueId, content))
         if (!posted || !current()) continue
+        settle({ commentId: posted.id, inputIds: delivery.inputIds, assignmentId: delivery.assignmentId, read: false })
         if (target.state.agentId && this.continuations.has(ticketId)) this.dispatched(ticketId, target.state.agentId)
-        settled.set(delivery.commentId, { commentId: posted.id, inputIds: delivery.inputIds, assignmentId: delivery.assignmentId, read: false })
       } catch (error) {
         if (this.host.closing() || (this.host.config.standardOnly && retryable(error))) throw error
-        this.failure(`Posting again the messages the run ${delivery.steeredRun} ended before reading`, error)
+        this.failure(`Posting again the Inputs from Multica comment ${delivery.commentId}`, error)
       }
     }
-    const latest = this.state(ticketId) ?? state
-    const deliveries = latest.deliveries.flatMap(delivery => {
-      if (!settled.has(delivery.commentId)) return [delivery]
-      const next = settled.get(delivery.commentId)
-      return next ? [next] : []
-    })
-    this.save(ticketId, { ...latest, deliveries })
   }
   /**
    * Why the ticket's issue is to be reassigned to another candidate now, if it is: a run of this Assignment failed because
@@ -1112,7 +1141,7 @@ export class MulticaExecutor implements Executor {
         : this.host.api.addComment(target.state.issueId, unanswered.resend, { parentId: unanswered.commentId }))
       if (!posted || !current()) return true
       if (target.state.agentId && this.continuations.has(ticketId)) this.dispatched(ticketId, target.state.agentId)
-      const refused = refusedOutcome(posted.trigger_outcomes ?? undefined, target.state.agentId)
+      const refused = refusedOutcome(posted.trigger_outcomes ?? undefined, this.routingAgent(target.state))
       if (refused) this.failure(what, `Multica started no run: ${refused}`)
       done()
       return !refused

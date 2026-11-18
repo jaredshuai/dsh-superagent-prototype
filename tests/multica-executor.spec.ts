@@ -871,13 +871,14 @@ describe('MulticaExecutor', () => {
       expect(h.state()!.agentId).toBe('a-ok')
     })
 
-    it.each([true, false])('retains the original assignee in legacy mode (stored locally: %s)', async stored => {
+    it.each([true, false])('does not reassign a legacy issue, including when its assignee is not stored (stored locally: %s)', async stored => {
       const h = setup(ticketWith([{ state: 'pending' }]), { agents: ['new-default'] })
       h.setState({ issueId: 'issue-1', ...stored ? { agentId: 'original' } : {}, deliveries: [], seen: [], runs: {} })
       h.setAssignee('original')
       await h.launch()
       expect(h.api.assignIssue).not.toHaveBeenCalled()
-      expect(h.state()!.agentId).toBe('original')
+      expect(h.state()!.agentId).toBe(stored ? 'original' : undefined)
+      expect(h.api.issue).not.toHaveBeenCalled()
       expect(h.api.addComment).toHaveBeenCalledTimes(1)
     })
 
@@ -892,7 +893,7 @@ describe('MulticaExecutor', () => {
       expect(h.state()!.agentId).toBe('a-ok-2')
     })
 
-    it('does not accept an authorless report while the actual assignee is unknown', async () => {
+    it('does not authorize an authorless or remotely assigned author without evidence of the old run', async () => {
       const h = candidates(true)
       h.setState({ issueId: 'issue-1', assignment: { id: 'a1', nonce: 'n' }, deliveries: [], seen: [], runs: {} })
       h.setTicket(ticketWith([{}]))
@@ -903,7 +904,8 @@ describe('MulticaExecutor', () => {
       h.setAssignee('a-ok-2')
       h.comments.push({ ...posted, id: 'k2', author_id: 'a-ok-2' })
       await h.executor.reconcile('t1')
-      expect(h.engine.report).toHaveBeenCalledExactlyOnceWith('t1', { state: 'ready', summary: 'unverified' })
+      expect(h.engine.report).not.toHaveBeenCalled()
+      expect(h.state()!.assignment!.reportAgentId).toBeNull()
     })
 
     it('waits rather than waking an issue already assigned to an offline standard agent, then picks an online backup', async () => {
@@ -1451,4 +1453,121 @@ describe('PR22 independent Multica routing', () => {
     await h.executor.reconcile('t1')
     expect(h.api.cancelRun).toHaveBeenCalledExactlyOnceWith('auto-retry')
   })
+})
+
+describe('PR22 recheck additional edge cases', () => {
+  async function auditSetup() {
+    const h = setup(ticketWith([{}]), { agents: ['std'], pickHealthy: true, standardOnly: true })
+    h.agents.push({ id: 'std', status: 'idle', runtime_id: 'r' })
+    h.runtimes.push({ id: 'r', status: 'online' })
+    await h.connect()
+    return h
+  }
+  it('persists a successful failed-steer resend before attempting another', async () => {
+    const h = await auditSetup()
+    h.setState({ issueId: 'issue-1', agentId: 'std', assignment: { id: 'a1', nonce: 'n' }, seen: [], runs: { old: 'completed' }, deliveries: [
+      { commentId: 's1', inputIds: ['i1'], assignmentId: 'a1', read: false, steeredRun: 'old' },
+      { commentId: 's2', inputIds: ['i2'], assignmentId: 'a1', read: false, steeredRun: 'old' },
+    ] })
+    h.runs.push({ id: 'old', agent_id: 'std', status: 'completed' })
+    for (const [id, content] of [['s1', 'steer one'], ['s2', 'steer two']] as const) {
+      h.comments.push({ id, issue_id: 'issue-1', author_type: 'member', content, created_at: '' })
+      h.receipts.set(id, [{ task_id: 'old', status: 'failed', failure_reason: 'turn_ended' }])
+    }
+    const ok = h.api.addComment.getMockImplementation()!
+    h.api.addComment.mockImplementationOnce(ok).mockRejectedValueOnce(new Error('second resend failed before committing'))
+    await h.executor.reconcile('t1')
+    expect(h.enqueued).toContainEqual({ kind: 'multicaReconcile', key: 't1' })
+    await h.retryReconcile()
+    expect(h.posted.map(item => item.content)).toEqual(['steer one', 'steer two'])
+  })
+  it('replays an unread Input on a healthy assignee after cancelling its excluded unclaimed run', async () => {
+    const h = await auditSetup()
+    h.runtimes[0]!.status = 'offline'
+    await h.push({ type: 'runtime:updated', payload: {} })
+    h.setState({ issueId: 'issue-1', agentId: 'premium', assignment: { id: 'a1', nonce: 'n' }, seen: [], runs: { old: 'queued' }, deliveries: [
+      { commentId: 'input', inputIds: ['i1'], assignmentId: 'a1', read: false },
+    ] })
+    h.runs.push({ id: 'old', agent_id: 'premium', trigger_comment_id: 'input', delivered_comment_ids: ['input'], status: 'queued' })
+    h.comments.push({ id: 'input', issue_id: 'issue-1', author_type: 'member', content: 'Original input', created_at: '' })
+    await h.executor.reconcile('t1')
+    expect(h.api.cancelRun).toHaveBeenCalledExactlyOnceWith('old')
+    expect(h.engine.inputsRead).not.toHaveBeenCalled()
+    expect(h.api.addComment).not.toHaveBeenCalled()
+    expect(h.state()!.deliveries[0]).toMatchObject({ commentId: 'input', read: false, replayAfterCancel: 'old' })
+    h.runtimes[0]!.status = 'online'
+    await h.push({ type: 'runtime:updated', payload: {} })
+    expect(h.api.assignIssue).toHaveBeenCalledExactlyOnceWith('issue-1', 'std')
+    expect(h.api.assignIssue.mock.invocationCallOrder[0]!).toBeLessThan(h.api.addComment.mock.invocationCallOrder[0]!)
+    expect(h.posted.map(item => item.content)).toEqual(['Original input'])
+    expect(h.engine.inputsRead).not.toHaveBeenCalled()
+    h.runs.push({ id: 'new', agent_id: 'std', trigger_comment_id: h.state()!.deliveries[0]!.commentId, status: 'running' })
+    await h.executor.reconcile('t1')
+    expect(h.engine.inputsRead).toHaveBeenCalledExactlyOnceWith('t1', ['i1'])
+  })
+  it('keeps an Input read without replay if the excluded daemon started before cancellation arrived', async () => {
+    const h = await auditSetup()
+    h.setState({ issueId: 'issue-1', agentId: 'premium', assignment: { id: 'a1', nonce: 'n' }, seen: [], runs: { old: 'queued' }, deliveries: [
+      { commentId: 'input', inputIds: ['i1'], assignmentId: 'a1', read: false },
+    ] })
+    h.runs.push({ id: 'old', agent_id: 'premium', trigger_comment_id: 'input', status: 'queued' })
+    h.comments.push({ id: 'input', issue_id: 'issue-1', author_type: 'member', content: 'Original input', created_at: '' })
+    h.api.cancelRun.mockImplementationOnce(async () => { h.runs[0]!.started_at = h.at(); h.runs[0]!.status = 'cancelled' })
+    await h.executor.reconcile('t1')
+    expect(h.engine.inputsRead).toHaveBeenCalledExactlyOnceWith('t1', ['i1'])
+    expect(h.api.addComment).not.toHaveBeenCalled()
+  })
+  it('retains the active run author for a legacy record without agentId when the actual issue assignee already changed', async () => {
+    const h = await auditSetup()
+    h.setState({ issueId: 'issue-1', assignment: { id: 'a1', nonce: 'n' }, seen: [], runs: { legacy: 'running' }, deliveries: [] })
+    h.setAssignee('std')
+    h.runs.push({ id: 'legacy', agent_id: 'premium', status: 'completed' })
+    h.comments.push({ ...agentComment('k1', report({ tool: 'report', state: 'progress', summary: 'From legitimate old run' }, 'n')), author_id: 'premium' })
+    await h.executor.reconcile('t1')
+    expect(h.engine.report).toHaveBeenCalledWith('t1', { state: 'progress', summary: 'From legitimate old run' })
+  })
+  it('explicitly migrates an unknown author even if the current assignee is already in the standard pool', async () => {
+    const h = await auditSetup()
+    h.setState({ issueId: 'issue-1', assignment: { id: 'a1', nonce: 'n' }, seen: [], runs: {}, deliveries: [] })
+    h.setAssignee('std')
+    h.setTicket(ticketWith([{}], { inputs: [{ id: 'i1', kind: 'text', text: 'Follow up', at: '' }] as Ticket['inputs'], undelivered: ['i1'] }))
+    await h.deliver()
+    expect(h.api.assignIssue).toHaveBeenCalledExactlyOnceWith('issue-1', 'std')
+    expect(h.api.addComment).toHaveBeenCalledOnce()
+    expect(h.state()!.assignment!.reportAgentId).toBe('std')
+  })
+  it.each([403, 404])('does not return a permanent %i assignee preflight error to the retrying delivery effect', async status => {
+    const { MulticaError } = await import('../src/executor/multica-api.ts')
+    const h = await auditSetup()
+    h.setState({ issueId: 'issue-1', agentId: 'std', assignment: { id: 'a1', nonce: 'n' }, seen: [], runs: {}, deliveries: [] })
+    h.setTicket(ticketWith([{}], { inputs: [{ id: 'i1', kind: 'text', text: 'Follow up', at: '' }] as Ticket['inputs'], undelivered: ['i1'] }))
+    h.api.issue.mockRejectedValue(new MulticaError('permanent GET failure', status))
+    await expect(h.deliver()).resolves.toBeUndefined()
+    expect(h.engine.deliveryFailed).toHaveBeenCalledWith('t1', 'a1', expect.stringContaining('permanent GET failure'))
+    expect(h.health.get()).toMatchObject({ state: 'error', detail: expect.stringContaining('permanent GET failure') })
+  })
+  it('still retries a transient assignee preflight error', async () => {
+    const { MulticaError } = await import('../src/executor/multica-api.ts')
+    const h = await auditSetup()
+    h.setState({ issueId: 'issue-1', agentId: 'std', assignment: { id: 'a1', nonce: 'n' }, seen: [], runs: {}, deliveries: [] })
+    h.setTicket(ticketWith([{}], { inputs: [{ id: 'i1', kind: 'text', text: 'Follow up', at: '' }] as Ticket['inputs'], undelivered: ['i1'] }))
+    h.api.issue.mockRejectedValueOnce(new MulticaError('temporary GET failure', 503))
+    await expect(h.deliver()).rejects.toThrow('temporary GET failure')
+    expect(h.api.addComment).not.toHaveBeenCalled()
+    await h.deliver()
+    expect(h.api.addComment).toHaveBeenCalledOnce()
+  })
+})
+
+it('PR22 recheck additional legacy launch preserves main fallback identity without GET', async () => {
+  const h = setup(ticketWith([{ state: 'ended' }, { state: 'pending' }]), { agents: [AGENT, 'backup'], pickHealthy: true })
+  h.setState({ issueId: 'issue-1', assignment: { id: 'a1', nonce: 'before' }, seen: [], runs: {}, deliveries: [] })
+  h.setAssignee('backup')
+  await h.launch('a2')
+  h.setTicket(ticketWith([{ state: 'ended' }, {}]))
+  h.comments.push(agentComment('k1', report({ tool: 'report', state: 'progress', summary: 'Original configured worker' }, h.state()!.assignment!.nonce, 'a2')))
+  await h.executor.reconcile('t1')
+  expect(h.api.assignIssue).not.toHaveBeenCalled()
+  expect(h.engine.report).toHaveBeenCalledWith('t1', { state: 'progress', summary: 'Original configured worker' })
+  expect(h.api.issue).not.toHaveBeenCalled()
 })

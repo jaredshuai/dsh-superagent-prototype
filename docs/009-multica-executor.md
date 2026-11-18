@@ -252,7 +252,7 @@ MCP 配置只有三层，全部不认 issue：
   之后的 Assignment（重试等）在同一 issue 发一条后续 Assignment 评论，带新 nonce，并把当时已有的 run 记为基线。
 - `deliver`：按第 7.1 节规则；成功发出评论即 `inputsDelivered`，带它的 run 开始运行时 `inputsRead`；steer 进 run 的，等 daemon 交付（回执 `delivered`）时 `inputsRead`，
   run 先结束了（回执 `failed`）就把原评论内容作为普通评论再发一次（第 8.3 节）；
-  Multica 返回 `blocked` / `deferred` 等不重试，记 `deliveryFailed`。
+  Multica 返回 `blocked` / `deferred` 等不重试，记 `deliveryFailed`。403/404 等永久 HTTP 错误也记录投递失败并写入 `worker` 健康项，不进入退避重试。
 - 每张 Ticket 的启动、Input 投递、改派、补发、取消和关闭共用一条写入队列；远端请求前后复核 Ticket 和 Assignment 是否仍有效。
   例如 Ticket 在启动评论请求在途时结束，先等该请求返回，再取消它起的 run、关闭 issue，不会并发关闭再跑一遍。
 - 对账：由 WebSocket 事件触发，每次（重）连接对所有有 issue 的未结束 Ticket 补一次。先处理新的 agent 评论里的回报块，
@@ -307,8 +307,9 @@ MCP 配置只有三层，全部不认 issue：
   - 起 run 的 POST 前再核对健康快照代数；已有 issue 还要重读 assignee，读完后在调用 POST 前再比对一次代数。读取错误不等于未指派，不据此改派。
     客户端只能依据已观测的健康和 assignee 拦截自己发出的请求，无法原子地保证网络另一端收到 POST 时状态仍未变化。
   - issue 的实际 assignee 是 `agentId`；standard 回报作者另记为 `assignment.reportAgentId`。续跑换 agent 前，在旧 run 已结束后读取并处理旧作者的最后评论，
-    再为新 run 切换授权。临时 GET/改派失败走持久化的 launch、delivery 或对账 effect 退避重试；standard 补发的临时失败也进入对账重试，不用等下个 WebSocket 事件。
-  - 未设置 standard 名单时沿用旧配置：已有 issue 的重试、唤醒继续给原 assignee，不按健康重新挑选；缺少 `agentId` 的旧状态对账仍以配置的首个 agent 为后备作者；
+    再为新 run 切换授权。旧票缺作者字段时，只从本地曾记为 `running`、可唯一对应到 agent 的 run 恢复；没有可信历史就记为未知，走改派流程，不用当前 assignee 验旧回报。
+    临时 GET/改派失败走持久化的 launch、delivery 或对账 effect 退避重试；standard 补发逐条落盘，后一条暂时失败时不会重发已明确成功的前一条。
+  - 未设置 standard 名单时沿用旧配置：已有 issue 的重试、唤醒不读取远端 assignee，也不改派；缺少 `agentId` 的旧状态以配置首个 agent 校验回报作者和评论触发结果；
     旧多候选仍有下述故障改派，单个 `MULTICA_AGENT_ID` 不做故障改派。
 - 全部候选不健康：没有 issue 的 Ticket 不建 issue，待启动的 Assignment 保持 pending；在途 Assignment 暂缓下一次投递。
   Executor 以 `progress` 回报挂一个待人工决定（「No Multica workstation is online to run this ticket…」）；若所有相关 standard ID 都无效，改为提示修正名单并重启服务。
@@ -334,6 +335,7 @@ MCP 配置只有三层，全部不认 issue：
     评论起新 agent 的 run。issue 不变，`superagent_ticket` metadata 照样反查到 Ticket。
   - 替换 Assignment 前处理已观测到的合法旧回报；新 Assignment 换了 nonce，之后不接受旧 Assignment 的回报。
     standard 对账独立取消已观测到的、明确带名单外 `agent_id` 的 `queued` / `deferred` / `waiting_local_directory` run，不需要先收到 Input，也不取消已认领的旧 run。
+    若该 run 尚未开始且承载未读 Input，先存重投标记，取消后在同一 Assignment 下等健康候选、沿用原评论内容重投；确认 run 确实开始或收到 steer 的 `delivered` 回执才记已读。
     不能阻止 Multica 在事件到达或取消生效前自行启动原生重试；名单限制保证的是执行器发起的请求，不是服务端原生重试的原子约束。
   - 没有其他健康候选：issue 不动（排队的 run 留着，原工作站回来仍可认领），按 #4 的「全部离线」行为问人一次（「…none of the other candidate Multica agents…」，
     记在 `multica-waiting:<ticket>`）。任一候选恢复健康后重新对账，改派成功即以 `question: null` 撤下问题。
