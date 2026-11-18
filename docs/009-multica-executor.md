@@ -231,19 +231,19 @@ MCP 配置只有三层，全部不认 issue：
 | `SUPERAGENT_EXECUTOR=multica` | 是 | 选择 MulticaExecutor |
 | `MULTICA_TOKEN` | 是 | `mul_` 个人 token，只放环境变量（如 `~/.config/superagent.env`），不进设置 |
 | `MULTICA_WORKSPACE_ID` | 是 | |
-| `MULTICA_STANDARD_AGENT_IDS` | 推荐 | 常规执行的有序候选列表，逗号分隔；配置后完全替代下面两项，全部离线则等待，不换到名单外的 agent。设置为空会报错 |
+| `MULTICA_STANDARD_AGENT_IDS` | 推荐 | 常规执行的有序候选列表，逗号分隔、保序去重；配置后完全替代下面两项，全部不健康则等待，不换到名单外的 agent。设置为空会报错 |
 | `MULTICA_AGENT_IDS` | 旧配置 | 有序的候选 Multica agent 列表，逗号分隔；新 Ticket 派给第一个健康的候选（见下「多候选」）。与 `MULTICA_AGENT_ID` 同时设置时以它为准 |
 | `MULTICA_AGENT_ID` | 旧配置 | 旧写法：只有一个 agent（= 一台机器上的一个 runtime），不看健康状态、每张 Ticket 都派给它，行为与 v1 相同 |
 | `MULTICA_SERVER_URL` | 否 | 默认 `https://api.multica.ai` |
 | `SUPERAGENT_MULTICA_REPOSITORY` | 否 | Worker 克隆的仓库，如 `https://github.com/jaredshuai/superagent-sandbox` |
 | `SUPERAGENT_MULTICA_INSTRUCTIONS` | 否 | 追加给每个 Worker 的说明，如「用 `gh-agent` 提交和开 PR」 |
 
-**日常派工**：在 `MULTICA_STANDARD_AGENT_IDS` 里只填给常规任务准备的 Multica agent ID，首选和备选都用同档模型。例如 `MULTICA_STANDARD_AGENT_IDS=standard-on-workstation-a,standard-on-workstation-b`（示例值需换成实际 ID）。旧配置只有在不设置此项时才会生效。切换前先让旧候选上的在途工作跑完；已经有 issue 的 Ticket 重试或唤醒时，如果原 agent 不在当前名单，先等常规候选上线，再把同一个 issue 改派过去。
+**日常派工**：在 `MULTICA_STANDARD_AGENT_IDS` 里只填给常规任务准备的 Multica agent ID，首选和备选都用同档模型。例如 `MULTICA_STANDARD_AGENT_IDS=standard-on-workstation-a,standard-on-workstation-b`（示例值需换成实际 ID）。旧配置只有在不设置此项时才会生效。名单在服务进程启动时读取，修改环境文件后必须重启服务，不支持热更新。切换前建议让旧候选上的在途工作跑完。
 
 实际模型仍由 Multica agent 和工作站上的编程 CLI 配置决定。给常规 agent 固定模型与凭据，不要把高级模型加入它的自动回退。需要用高级模型时，由人先确认，再在工作站手动运行这一轮；本版本没有飞书升级指令。复杂任务可以手动用 LoopForge Local 跑 SOP，走 SOP 不会改变模型档位。
 
 **与第 2 节的差异**：回报防伪第一版不用 HMAC（要求 LLM 在 shell 里算 HMAC 不可靠），改为三重校验：
-评论作者必须是配置的 agent（`author_type = agent`、`author_id` 匹配，由 Multica 服务端保证）、块内 `assignment` 必须是当前 Assignment、
+评论作者必须是该 issue 的执行 agent（`author_type = agent`、`author_id` 匹配，由 Multica 服务端保证）、块内 `assignment` 必须是当前 Assignment、
 `nonce` 必须等于该 Assignment 在 issue 描述（或后续 Assignment 评论）里下发的随机值。旧 Assignment 的回报因 nonce 不同一律拒收。
 
 **行为要点**：
@@ -292,14 +292,19 @@ MCP 配置只有三层，全部不认 issue：
   机器人 / CI 发的触发（`Trigger.human` 为假）在给 Worker 的卡片里带 `"automated": true`（首条 Assignment 的 `trigger` / `batch` 与之后的
   `superagent-input` 都是），描述写明这类消息只当作对工作的反馈、不发 `ack`——Engine 会拒掉对它们的确认（`ackNotPerson`），与 DSH Worker 的
   skill「Do not acknowledge bots or CI」一致。
-- 多候选（`MULTICA_AGENT_IDS`）：候选健康 = agent 存在、未归档、`status` 不是 `offline`，且它绑定的 runtime `status = online`。
+- 有序候选（`MULTICA_STANDARD_AGENT_IDS` 或旧 `MULTICA_AGENT_IDS`）：候选健康 = agent 存在、未归档、`status` 不是 `offline`，且它绑定的 runtime `status = online`。
   健康快照来自 REST `GET /api/agents` 与 `GET /api/runtimes`，只在事件流每次（重）连接时、以及收到 `agent:` / `runtime:` / `daemon:`
   事件（`daemon:heartbeat*` 除外）时、以及某个候选的暂停到期时（见下「跨工作站改派」）取一次（同一时刻多个请求合并成一次），不做周期轮询（ADR 0002）。快照到手之前不派新 Ticket。
-  只有**新 Ticket**（还没有 issue 的）按健康挑选；已有 issue 的后续 Assignment 仍发到该 issue 已指派的 agent，换 agent 只经改派（见下「跨工作站改派」）。
-  issue 指派给哪个 agent 记在 Ticket 状态的 `agentId` 里，回报作者校验与 `trigger_outcomes` 检查都以它为准。
-- 全部候选不健康：Ticket 的 Assignment 停在 pending（不建 issue），Executor 以 `progress` 回报挂一个待人工决定
-  （「No Multica workstation is online to run this ticket…」），每个 Assignment 只问一次（记在 `multica-waiting:<ticket>`，重连、重启都不重复）。
-  任一候选恢复健康后排队的 Ticket 自动派发，派发成功后若这个问题仍挂着就以 `question: null` 撤下。
+  启用 standard 名单时，首次快照会在 `worker` 健康项列出未知、已归档或未绑定 runtime 的 ID；跳过这些 ID，仍可使用其他有效的候选。
+  - 新 Ticket 取名单中首个健康候选；重试或唤醒已有 issue 时读 Multica 上的真实 assignee（旧票本地可能没有 `agentId`），只有它仍在名单内且健康才保留；
+    否则选名单中首个健康候选、改派并保存 assignee 后，才在**同一个 issue** 发启动评论。
+  - 在途 Assignment 的旧 run 可以自然结束并回报，但给不合格 assignee 的后续 Input（包括可能自动起新 run 的 steer）、steer 失败补发与拒收补发都暂缓。
+    已认领的 run 结束后，若有健康候选，先改派原 issue，再投递，沿用当前 Assignment；不启动新的名单外 run。
+  - 未设置 standard 名单时沿用旧配置：已有 issue 的重试、唤醒继续给原 assignee，不按健康重新挑选；旧多候选仍有下述故障改派，单个 `MULTICA_AGENT_ID` 不做故障改派。
+  issue 指派给哪个 agent 记在 Ticket 状态的 `agentId` 里，回报作者校验与 `trigger_outcomes` 检查以它为准。
+- 全部候选不健康：没有 issue 的 Ticket 不建 issue，待启动的 Assignment 保持 pending；在途 Assignment 暂缓下一次投递。
+  Executor 以 `progress` 回报挂一个待人工决定（「No Multica workstation is online to run this ticket…」）；若所有相关 standard ID 都无效，改为提示修正名单并重启服务。
+  相同问题每个 Assignment 只问一次（记在 `multica-waiting:<ticket>`，重连、重启都不重复），健康候选可用后自动继续，并撤下仍打开的问题。
   **实测（2026-11-05，jxccs，`kill -STOP` 冻结 CLI 与桌面端两个 daemon 4 分钟模拟整机断网，不触发 Deregister）**：
   - 掉线：最后一次心跳后约 2 分 37 秒，服务端推 `daemon:register`，payload 只有 `{"action":"stale_sweep"}`（`actor_type: system`，不带 runtime / agent id），
     同类事件推了两次，分两批把本机 6 个 runtime 置为 `offline`。
@@ -307,7 +312,7 @@ MCP 配置只有三层，全部不认 issue：
   - 全程 agent 的 `status` 一直是 `idle`，不会变成 `offline`：健康必须看 runtime 状态，不能只看 agent。
   - 稳态下（90 s 探针）没有任何此类事件。所以「收到 `daemon:` 事件就重取快照」正好覆盖掉线与恢复，事件不带 id 也无妨。
   同理，取快照的 REST 请求失败时不重试（不轮询），记在 `worker` 健康项里，等下一个此类事件或重连再取。
-- 跨工作站改派（#8，ADR 0004，`multica-failover.ts`）：只在多候选（`MULTICA_AGENT_IDS`）下做，单个 `MULTICA_AGENT_ID` 从不改派。每次对账判断 issue 是否要换 agent：
+- 跨工作站改派（#8，ADR 0004，`multica-failover.ts`）：只在启用了有序候选列表时做（standard 模式仅对名单内 assignee 走此故障改派；单个旧 `MULTICA_AGENT_ID` 从不改派）。每次对账判断 issue 是否要换 agent：
   - issue 的 run `queued` 未被认领超过 **5 分钟**（从 run 的 `created_at` 算）；不到 5 分钟时挂一个到点的计时器，到点再对账一次（只为这一个时刻，不轮询）。
     2–3 分钟的同机 daemon 切换空窗不会触发。只要有 run 是 `running` / `dispatched`（被认领了），就不改派，并撤掉待做的改派与挂着的问题。
   - 这个 Assignment 的 run 以 `runtime_offline` / `runtime_recovery` / `runtime_reconnect_timeout` / `timeout` / `queued_expired` 失败 ⇒ 改派

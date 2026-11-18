@@ -23,6 +23,11 @@ describe('multicaConfigFromEnv', () => {
       .toMatchObject({ agents: ['day-1', 'day-2'], pickHealthy: true })
   })
 
+  it('deduplicates standard IDs without changing their priority', () => {
+    expect(multicaConfigFromEnv({ ...base, MULTICA_STANDARD_AGENT_IDS: 'a2, a1, a2, a3, a1' }))
+      .toMatchObject({ agents: ['a2', 'a1', 'a3'], pickHealthy: true, standardOnly: true })
+  })
+
   it('does not fall back to a legacy agent when the standard pool is empty', () => {
     expect(() => multicaConfigFromEnv({ ...base, MULTICA_STANDARD_AGENT_IDS: ' , ', MULTICA_AGENT_ID: 'premium' }))
       .toThrow('a non-empty MULTICA_STANDARD_AGENT_IDS')

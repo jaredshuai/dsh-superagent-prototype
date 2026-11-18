@@ -36,8 +36,9 @@ type RuntimeRow = { id: string; status: string }
 /** Lets queued promise chains, such as a health refresh and the launches it releases, run to the end. */
 const settle = async () => { for (let i = 0; i < 20; i++) await new Promise(resolve => setTimeout(resolve, 0)) }
 
-function setup(initial: Ticket, options: { agents?: string[]; pickHealthy?: boolean } = {}) {
+function setup(initial: Ticket, options: { agents?: string[]; pickHealthy?: boolean; standardOnly?: boolean } = {}) {
   let ticket = initial
+  let assignee: string | null = null
   const sockets: FakeSocket[] = []
   const agents: AgentRow[] = []
   const runtimes: RuntimeRow[] = []
@@ -69,9 +70,10 @@ function setup(initial: Ticket, options: { agents?: string[]; pickHealthy?: bool
   let healthNow: { state: string; detail?: string } | undefined
   const health = { get: vi.fn(() => healthNow), set: vi.fn((next: { state: string; detail?: string }) => { healthNow = next }), release: vi.fn() }
   const api = {
-    createIssue: vi.fn(async () => ({ id: 'issue-1', identifier: 'JAR-1' })),
+    createIssue: vi.fn(async (input: { agentId: string }) => { assignee = input.agentId; return { id: 'issue-1', identifier: 'JAR-1' } }),
     setMetadata: vi.fn(async () => {}),
     findIssues: vi.fn(async () => []),
+    issue: vi.fn(async (id: string) => ({ id, assignee_type: assignee ? 'agent' : null, assignee_id: assignee })),
     runs: vi.fn(async () => runs.map(run => ({ ...run }))),
     comments: vi.fn(async () => comments.map(comment => ({ ...comment }))),
     addComment: vi.fn(async (_issue: string, content: string, options: { steer?: string[]; parentId?: string } = {}): Promise<PostedComment> => {
@@ -91,7 +93,7 @@ function setup(initial: Ticket, options: { agents?: string[]; pickHealthy?: bool
     }),
     steerReceipts: vi.fn(async () => new Map([...receipts].map(([id, list]) => [id, list.map(receipt => ({ ...receipt }))]))),
     cancelRun: vi.fn(async (id: string) => { const run = runs.find(item => item.id === id); if (run) run.status = 'cancelled' }),
-    assignIssue: vi.fn(async (_issue: string, _agent: string) => {}),
+    assignIssue: vi.fn(async (_issue: string, agent: string) => { assignee = agent }),
     runMessages: vi.fn(async (id: string) => messages.get(id) ?? []),
     setStatus: vi.fn(async (_issue: string, _status: string) => {}),
     agents: vi.fn(async () => agents.map(agent => ({ ...agent }))),
@@ -111,7 +113,7 @@ function setup(initial: Ticket, options: { agents?: string[]; pickHealthy?: bool
     sessions: { relay: vi.fn() },
     machine: { stateDir: '/state' }, lifetime: new AbortController().signal,
     config: { serverUrl: 'https://multica.test', workspaceId: 'w', token: 'mul_x', agents: options.agents ?? [AGENT],
-      pickHealthy: options.pickHealthy ?? false, repository: 'https://github.com/o/r' },
+      pickHealthy: options.pickHealthy ?? false, standardOnly: options.standardOnly, repository: 'https://github.com/o/r' },
     socketFactory: () => { const socket = new FakeSocket(); sockets.push(socket); return socket },
     closing: () => false, paused: () => false, clock,
     sourceLink: async () => ({ source_url: 'https://github.com/o/r/issues/2' }), repliedTo: () => undefined, sendReplies: vi.fn(async () => {}),
@@ -142,7 +144,8 @@ function setup(initial: Ticket, options: { agents?: string[]; pickHealthy?: bool
     },
     /** A new executor over the same store and Multica, as after a restart. */
     restart: () => { executor = new MulticaExecutor(host) },
-    setState: (next: MulticaTicketState) => { kv.set(MULTICA_KV.ticket('t1'), next) },
+    setState: (next: MulticaTicketState) => { kv.set(MULTICA_KV.ticket('t1'), next); assignee = next.agentId ?? null },
+    setAssignee: (next: string | null) => { assignee = next },
     failPosts: (count: number) => { postFailures = count },
     state: () => kv.get(MULTICA_KV.ticket('t1')) as MulticaTicketState | undefined,
     setTicket: (next: Ticket) => { ticket = next },
@@ -716,15 +719,14 @@ describe('MulticaExecutor', () => {
 
   describe('candidate agents', () => {
     const CANDIDATES = ['a-off-runtime', 'a-off', 'a-ok', 'a-ok-2']
-    function candidates() {
-      const h = setup(ticketWith([{ state: 'pending' }]), { agents: CANDIDATES, pickHealthy: true })
+    function candidates(standardOnly = false) {
+      const h = setup(ticketWith([{ state: 'pending' }]), { agents: CANDIDATES, pickHealthy: true, standardOnly })
       h.runtimes.push({ id: 'rt-down', status: 'offline' }, { id: 'rt-up', status: 'online' })
       h.agents.push({ id: 'a-off-runtime', status: 'idle', runtime_id: 'rt-down' }, { id: 'a-off', status: 'offline', runtime_id: 'rt-up' },
         { id: 'a-ok', status: 'working', runtime_id: 'rt-up' }, { id: 'a-ok-2', status: 'idle', runtime_id: 'rt-up' })
       return h
     }
-    const assignedTo = (h: ReturnType<typeof setup>) =>
-      (h.api.createIssue.mock.calls as unknown as [{ agentId: string }][]).map(([input]) => input.agentId)
+    const assignedTo = (h: ReturnType<typeof setup>) => h.api.createIssue.mock.calls.map(([input]) => input.agentId)
 
     it('assigns a new ticket to the first healthy candidate, skipping unhealthy ones', async () => {
       const h = candidates()
@@ -783,8 +785,8 @@ describe('MulticaExecutor', () => {
         return next
       }) as never)
     }
-    function allOffline() {
-      const h = candidates()
+    function allOffline(standardOnly = false) {
+      const h = candidates(standardOnly)
       for (const agent of h.agents) agent.status = 'offline'
       keepQuestions(h)
       return h
@@ -812,7 +814,7 @@ describe('MulticaExecutor', () => {
     })
 
     it('waits for a standard candidate before resuming an issue assigned to an excluded agent', async () => {
-      const h = allOffline()
+      const h = allOffline(true)
       h.agents.push({ id: 'premium', status: 'idle', runtime_id: 'rt-up' })
       h.setState({ issueId: 'issue-1', agentId: 'premium', closed: 'done', deliveries: [], seen: [], runs: {} })
       await h.connect()
@@ -831,6 +833,175 @@ describe('MulticaExecutor', () => {
       expect(h.api.assignIssue.mock.invocationCallOrder[0]).toBeLessThan(h.api.addComment.mock.invocationCallOrder[0]!)
       expect(h.engine.assignmentStarted).toHaveBeenCalledWith('t1', 'a1')
       expect(h.host.store.tickets.get('t1')!.attention).toBeUndefined()
+    })
+
+    it.each([true, false])('checks the old issue assignee even with no stored agentId (candidate initially online: %s)', async online => {
+      const h = online ? candidates(true) : allOffline(true)
+      h.setState({ issueId: 'issue-1', closed: 'done', deliveries: [], seen: [], runs: {} })
+      h.setAssignee('premium')
+      await h.connect()
+      await h.launch()
+      expect(h.api.issue).toHaveBeenCalledWith('issue-1')
+      if (!online) {
+        expect(h.api.addComment).not.toHaveBeenCalled()
+        expect(h.api.assignIssue).not.toHaveBeenCalled()
+        h.agents.find(agent => agent.id === 'a-ok')!.status = 'idle'
+        await h.push({ type: 'agent:status', payload: {} })
+        await h.runLaunches()
+      }
+      expect(h.api.assignIssue).toHaveBeenCalledExactlyOnceWith('issue-1', 'a-ok')
+      expect(h.api.addComment).toHaveBeenCalledTimes(1)
+      expect(h.api.assignIssue.mock.invocationCallOrder[0]!).toBeLessThan(h.api.addComment.mock.invocationCallOrder[0]!)
+      expect(h.state()!.agentId).toBe('a-ok')
+    })
+
+    it('explicitly assigns a legacy issue whose real assignee is not known', async () => {
+      const h = candidates(true)
+      h.setState({ issueId: 'issue-1', deliveries: [], seen: [], runs: {} })
+      await h.connect()
+      await h.launch()
+      expect(h.api.assignIssue).toHaveBeenCalledExactlyOnceWith('issue-1', 'a-ok')
+      expect(h.state()!.agentId).toBe('a-ok')
+    })
+
+    it.each([true, false])('retains the original assignee in legacy mode (stored locally: %s)', async stored => {
+      const h = setup(ticketWith([{ state: 'pending' }]), { agents: ['new-default'] })
+      h.setState({ issueId: 'issue-1', ...stored ? { agentId: 'original' } : {}, deliveries: [], seen: [], runs: {} })
+      h.setAssignee('original')
+      await h.launch()
+      expect(h.api.assignIssue).not.toHaveBeenCalled()
+      expect(h.state()!.agentId).toBe('original')
+      expect(h.api.addComment).toHaveBeenCalledTimes(1)
+    })
+
+    it('keeps a healthy actual standard assignee even when the local state shows a different one', async () => {
+      const h = candidates(true)
+      h.setState({ issueId: 'issue-1', agentId: 'superseded', deliveries: [], seen: [], runs: {} })
+      h.setAssignee('a-ok-2')
+      await h.connect()
+      await h.launch()
+      expect(h.api.assignIssue).not.toHaveBeenCalled()
+      expect(h.api.addComment).toHaveBeenCalledTimes(1)
+      expect(h.state()!.agentId).toBe('a-ok-2')
+    })
+
+    it('does not accept an authorless report while the actual assignee is unknown', async () => {
+      const h = candidates(true)
+      h.setState({ issueId: 'issue-1', assignment: { id: 'a1', nonce: 'n' }, deliveries: [], seen: [], runs: {} })
+      h.setTicket(ticketWith([{}]))
+      const posted = agentComment('k1', report({ tool: 'report', state: 'ready', summary: 'unverified' }, 'n'))
+      h.comments.push({ ...posted, author_id: undefined })
+      await h.connect()
+      expect(h.engine.report).not.toHaveBeenCalled()
+      h.setAssignee('a-ok-2')
+      h.comments.push({ ...posted, id: 'k2', author_id: 'a-ok-2' })
+      await h.executor.reconcile('t1')
+      expect(h.engine.report).toHaveBeenCalledExactlyOnceWith('t1', { state: 'ready', summary: 'unverified' })
+    })
+
+    it('waits rather than waking an issue already assigned to an offline standard agent, then picks an online backup', async () => {
+      const h = allOffline(true)
+      h.setState({ issueId: 'issue-1', agentId: 'a-ok', closed: 'done', deliveries: [], seen: [], runs: {} })
+      await h.connect()
+      await h.launch()
+      expect(h.api.setStatus).not.toHaveBeenCalled()
+      expect(h.api.addComment).not.toHaveBeenCalled()
+      h.agents.find(agent => agent.id === 'a-ok-2')!.status = 'idle'
+      await h.push({ type: 'agent:status', payload: {} })
+      await h.runLaunches()
+      expect(h.api.assignIssue).toHaveBeenCalledExactlyOnceWith('issue-1', 'a-ok-2')
+      expect(h.api.addComment).toHaveBeenCalledTimes(1)
+    })
+
+    it('does not steer or cancel a claimed run on an excluded agent, then moves the same issue before delivering the Input', async () => {
+      const h = allOffline(true)
+      h.setState({ issueId: 'issue-1', agentId: 'premium', assignment: { id: 'a1', nonce: 'n' }, deliveries: [], seen: [], runs: {} })
+      const inputs = [{ id: 'i1', kind: 'text', text: 'Follow up', at: '' }] as Ticket['inputs']
+      h.setTicket(ticketWith([{}], { inputs, undelivered: ['i1'] }))
+      h.runs.push({ id: 'old', agent_id: 'premium', status: 'running', can_supplement: true })
+      await h.connect()
+      await h.deliver()
+      expect(h.api.cancelRun).not.toHaveBeenCalled()
+      expect(h.api.assignIssue).not.toHaveBeenCalled()
+      expect(h.api.addComment).not.toHaveBeenCalled()
+      expect(h.engine.inputsDelivered).not.toHaveBeenCalled()
+      // The old agent can still finish and report while on the issue.
+      h.comments.push({ ...agentComment('k1', report({ tool: 'report', state: 'progress', summary: 'Old work done' }, 'n')), author_id: 'premium' })
+      h.runs[0]!.status = 'completed'
+      await h.executor.reconcile('t1')
+      expect(h.engine.report).toHaveBeenCalledWith('t1', { state: 'progress', summary: 'Old work done' })
+      await h.deliver()
+      expect(h.api.addComment).not.toHaveBeenCalled()
+      h.enqueued.length = 0
+      h.agents.find(agent => agent.id === 'a-ok')!.status = 'idle'
+      await h.push({ type: 'agent:status', payload: {} })
+      expect(h.enqueued).toContainEqual({ kind: 'delivery', key: 't1' })
+      await h.deliver()
+      expect(h.api.assignIssue).toHaveBeenCalledExactlyOnceWith('issue-1', 'a-ok')
+      expect(h.api.assignIssue.mock.invocationCallOrder[0]!).toBeLessThan(h.api.addComment.mock.invocationCallOrder[0]!)
+      expect(h.posted).toEqual([{ content: expect.stringContaining('Follow up') }])
+      expect(h.engine.inputsDelivered).toHaveBeenCalledExactlyOnceWith('t1', 'a1', ['i1'])
+      expect(h.engine.assignmentReassigned).not.toHaveBeenCalled()
+      expect(h.state()).toMatchObject({ issueId: 'issue-1', agentId: 'a-ok', assignment: { id: 'a1', nonce: 'n' } })
+    })
+
+    it('defers a failed steer resend until the issue can move from its old assignee', async () => {
+      const h = allOffline(true)
+      h.setState({ issueId: 'issue-1', agentId: 'premium', assignment: { id: 'a1', nonce: 'n' }, seen: [], runs: {},
+        deliveries: [{ commentId: 'steer', inputIds: ['i1'], assignmentId: 'a1', read: false, steeredRun: 'old' }] })
+      h.setTicket(ticketWith([{}]))
+      h.runs.push({ id: 'old', agent_id: 'premium', status: 'completed' })
+      h.receipts.set('steer', [{ task_id: 'old', status: 'failed', failure_reason: 'turn_ended' }])
+      h.comments.push({ id: 'steer', issue_id: 'issue-1', author_type: 'member', content: 'Steered Input', created_at: '' })
+      await h.connect()
+      expect(h.api.addComment).not.toHaveBeenCalled()
+      expect(h.state()!.deliveries[0]!.steeredRun).toBe('old')
+      h.agents.find(agent => agent.id === 'a-ok')!.status = 'idle'
+      await h.push({ type: 'agent:status', payload: {} })
+      expect(h.api.assignIssue).toHaveBeenCalledExactlyOnceWith('issue-1', 'a-ok')
+      expect(h.posted).toEqual([{ content: 'Steered Input' }])
+      expect(h.api.assignIssue.mock.invocationCallOrder[0]!).toBeLessThan(h.api.addComment.mock.invocationCallOrder[0]!)
+      expect(h.state()!.deliveries).toEqual([{ commentId: 'c1', inputIds: ['i1'], assignmentId: 'a1', read: false }])
+    })
+
+    it('defers a refusal resend until the issue can move, while its no-run note is still delivered', async () => {
+      const h = allOffline(true)
+      h.setState({ issueId: 'issue-1', agentId: 'premium', assignment: { id: 'a1', nonce: 'n' }, deliveries: [], seen: [], runs: {} })
+      h.setTicket(ticketWith([{}]))
+      h.runs.push({ id: 'old', agent_id: 'premium', status: 'completed' })
+      h.comments.push({ ...agentComment('k1', report({ tool: 'report', state: 'ready', summary: 'x' }, 'guess')), author_id: 'premium' })
+      await h.connect()
+      expect(h.posted).toEqual([{ content: expect.stringMatching(/^\/note /), parentId: 'k1' }])
+      expect(h.api.assignIssue).not.toHaveBeenCalled()
+      expect(h.engine.turnEnded).not.toHaveBeenCalled()
+      h.agents.find(agent => agent.id === 'a-ok')!.status = 'idle'
+      await h.push({ type: 'agent:status', payload: {} })
+      expect(h.api.assignIssue).toHaveBeenCalledExactlyOnceWith('issue-1', 'a-ok')
+      expect(h.posted[1]).toEqual({ content: expect.stringMatching(/^superagent: /), parentId: 'k1' })
+      expect(h.api.assignIssue.mock.invocationCallOrder[0]!).toBeLessThan(h.api.addComment.mock.invocationCallOrder[1]!)
+      expect(h.state()!.resentFor).toBe('a1')
+    })
+
+    it('reports missing and invalid standard IDs at startup but still picks the first valid healthy agent', async () => {
+      const h = setup(ticketWith([{ state: 'pending' }]), { agents: ['typo', 'archived', 'unbound', 'ok'], pickHealthy: true, standardOnly: true })
+      h.runtimes.push({ id: 'rt', status: 'online' })
+      h.agents.push({ id: 'archived', status: 'idle', runtime_id: 'rt', archived_at: '2026-11-05' },
+        { id: 'unbound', status: 'idle' }, { id: 'ok', status: 'idle', runtime_id: 'rt' })
+      await h.connect()
+      expect(h.health.get()).toMatchObject({ state: 'error', detail: expect.stringMatching(/MULTICA_STANDARD_AGENT_IDS.*typo.*archived.*unbound/) })
+      await h.launch()
+      expect(assignedTo(h)).toEqual(['ok'])
+    })
+
+    it('asks for a configuration fix instead of a workstation when all standard IDs are unknown', async () => {
+      const h = setup(ticketWith([{ state: 'pending' }]), { agents: ['typo'], pickHealthy: true, standardOnly: true })
+      h.runtimes.push({ id: 'rt', status: 'online' })
+      h.agents.push({ id: 'premium', status: 'idle', runtime_id: 'rt' })
+      await h.connect()
+      await h.launch()
+      expect(h.api.createIssue).not.toHaveBeenCalled()
+      expect(h.engine.assignmentStarted).not.toHaveBeenCalled()
+      expect(h.engine.report).toHaveBeenCalledWith('t1', expect.objectContaining({ question: expect.stringMatching(/MULTICA_STANDARD_AGENT_IDS.*typo.*restart/) }))
     })
 
     it('dispatches a queued ticket once a candidate comes online, and withdraws the question', async () => {
